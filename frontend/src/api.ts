@@ -54,6 +54,7 @@ export const api = {
     form.append('file', file);
     return request<Entity>(`/entities/${entityId}/reference-images`, { method: 'POST', body: form });
   },
+  deleteEntityImage: (imageId: string) => request<Entity>(`/entity-images/${imageId}`, { method: 'DELETE' }),
   generateFrames: (projectId: string, scriptIds: string[]) =>
     request<VideoFrame[]>(`/projects/${projectId}/frames/generate`, {
       method: 'POST',

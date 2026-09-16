@@ -225,6 +225,14 @@ async function setMainImage(entity: Entity, imageId: string) {
   await loadProject(entity.project_id, 'images');
 }
 
+async function deleteImage(imageId: string) {
+  if (!selectedEntity.value) return;
+  if (!window.confirm('删除这张图片？')) return;
+  const updated = await run(() => api.deleteEntityImage(imageId), '图片已删除');
+  if (!updated || !currentProject.value?.entities) return;
+  currentProject.value.entities = currentProject.value.entities.map((item) => (item.id === updated.id ? updated : item));
+}
+
 function toggleAll(target: 'frame' | 'export') {
   const ids = scripts.value.map((script) => script.id);
   const selected = target === 'frame' ? selectedFrameScriptIds : selectedExportScriptIds;
@@ -395,7 +403,7 @@ onMounted(async () => {
           <button class="primary" :disabled="!currentProject || scripts.length === 0 || loading" @click="analyzeScripts">解析剧本</button>
         </div>
         <div v-if="graph.nodes.length" class="graph-layout">
-          <svg class="graph-canvas" viewBox="0 0 920 560" role="img">
+          <svg class="graph-canvas" viewBox="0 0 920 760" role="img">
             <line
               v-for="edge in graph.edges"
               :key="edge.id"
@@ -493,11 +501,19 @@ onMounted(async () => {
               </label>
             </div>
             <div class="gallery">
-              <article v-for="image in selectedEntity.images" :key="image.id" class="image-card">
+              <article
+                v-for="image in selectedEntity.images"
+                :key="image.id"
+                class="image-card"
+                :class="{ main: selectedEntity.main_image_id === image.id }"
+              >
                 <img :src="assetUrl(image.image_url)" :alt="selectedEntity.name" />
-                <button class="secondary" @click="setMainImage(selectedEntity, image.id)">
-                  {{ selectedEntity.main_image_id === image.id ? '主参考图' : '设为主图' }}
-                </button>
+                <div class="image-actions">
+                  <button class="secondary" @click="setMainImage(selectedEntity, image.id)">
+                    {{ selectedEntity.main_image_id === image.id ? '主参考图' : '设为主图' }}
+                  </button>
+                  <button class="danger" @click="deleteImage(image.id)">删除</button>
+                </div>
               </article>
             </div>
           </div>

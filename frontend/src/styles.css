@@ -468,14 +468,40 @@ textarea:focus {
   display: block;
   width: 100%;
   aspect-ratio: 4 / 3;
+  border: 3px solid transparent;
   border-radius: 8px;
   object-fit: cover;
   background: #eef2f7;
 }
 
-.image-card button {
-  width: 100%;
+.image-card.main {
+  border-color: #ef4444;
+  box-shadow: 0 0 0 3px rgba(239, 68, 68, 0.12);
+}
+
+.image-card.main img {
+  border-color: #ef4444;
+}
+
+.image-actions {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 8px;
   margin-top: 10px;
+}
+
+.image-actions button {
+  width: 100%;
+}
+
+.danger {
+  min-height: 38px;
+  border: 1px solid #fecaca;
+  border-radius: 8px;
+  background: #fff1f2;
+  padding: 8px 12px;
+  color: #be123c;
+  font-weight: 800;
 }
 
 .frame-list {

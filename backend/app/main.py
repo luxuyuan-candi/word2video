@@ -430,12 +430,17 @@ def get_scripts_by_ids(project_id: str, script_ids: list[str]) -> list[dict[str,
     return selected
 
 
-def guess_entities(script: str) -> list[dict[str, str]]:
-    patterns = [
-        ("character", ["小明", "小红", "少年", "女孩", "男孩", "老师", "主角", "老人", "摄影师"]),
-        ("object", ["钥匙", "手机", "盒子", "书", "信", "机器", "产品", "背包", "手表", "相机"]),
-        ("scene", ["城市", "房间", "办公室", "学校", "街道", "森林", "海边", "实验室", "广场", "天台", "书店"]),
+def entity_patterns() -> list[tuple[str, list[str]]]:
+    return [
+        ("character", ["小明", "小红", "少年", "女孩", "男孩", "老师", "主角", "老人", "摄影师", "母亲", "父亲", "队长", "医生", "学生", "机器人"]),
+        ("object", ["钥匙", "手机", "盒子", "书", "信", "机器", "产品", "背包", "手表", "相机", "门", "电脑", "地图", "灯", "飞船", "药瓶"]),
+        ("scene", ["城市", "房间", "办公室", "学校", "街道", "森林", "海边", "实验室", "广场", "天台", "书店", "走廊", "教室", "车站", "医院", "餐厅"]),
+        ("concept", ["星河", "梦想", "危险", "秘密", "回忆", "希望", "恐惧", "温暖", "孤独", "未来", "危机", "胜利"]),
     ]
+
+
+def guess_entities(script: str) -> list[dict[str, str]]:
+    patterns = entity_patterns()
     found: list[dict[str, str]] = []
     for entity_type, words in patterns:
         for word in words:
@@ -455,7 +460,21 @@ def guess_entities(script: str) -> list[dict[str, str]]:
         ]
     if not any(item["type"] == "concept" for item in found):
         found.append({"name": "核心情绪", "type": "concept", "description": "贯穿剧本的画面氛围和情绪主题。"})
-    return found[:12]
+    return found[:18]
+
+
+def split_sentences(content: str) -> list[str]:
+    sentences = re.split(r"(?<=[。！？.!?])\s*|\n+", content)
+    return [sentence.strip() for sentence in sentences if sentence and sentence.strip()]
+
+
+def summarize_event(sentence: str, index: int) -> str:
+    compact = re.sub(r"\s+", "", sentence)
+    return compact[:16] or f"事件{index}"
+
+
+def event_description(sentence: str, script_title: str) -> str:
+    return f"《{script_title}》中的叙事事件：{sentence}"
 
 
 def default_prompt(entity: dict[str, Any]) -> str:
@@ -560,6 +579,79 @@ def upsert_graph_node(
     return node_id
 
 
+def insert_event_node(
+    conn: sqlite3.Connection,
+    project_id: str,
+    script_id: str,
+    script_title: str,
+    sentence: str,
+    index: int,
+) -> str:
+    node_id = str(uuid.uuid4())
+    event_name = summarize_event(sentence, index)
+    conn.execute(
+        """
+        INSERT INTO graph_nodes (
+            id, project_id, type, name, description, source_text, source_script_ids,
+            change_state, entity_id, x, y
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            node_id,
+            project_id,
+            "event",
+            event_name,
+            event_description(sentence, script_title),
+            sentence,
+            dump_ids([script_id]),
+            "new",
+            None,
+            180 + 150 * (index % 5),
+            320 + 105 * (index // 5),
+        ),
+    )
+    return node_id
+
+
+def insert_graph_edge(
+    conn: sqlite3.Connection,
+    project_id: str,
+    source_node_id: str,
+    target_node_id: str,
+    relation: str,
+    description: str,
+    source_text: str,
+    script_id: str,
+) -> None:
+    exists = conn.execute(
+        """
+        SELECT id FROM graph_edges
+        WHERE project_id = ? AND source_node_id = ? AND target_node_id = ? AND relation = ?
+        """,
+        (project_id, source_node_id, target_node_id, relation),
+    ).fetchone()
+    if exists:
+        return
+    conn.execute(
+        """
+        INSERT INTO graph_edges (
+            id, project_id, source_node_id, target_node_id, relation,
+            description, source_text, source_script_ids
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            str(uuid.uuid4()),
+            project_id,
+            source_node_id,
+            target_node_id,
+            relation,
+            description,
+            source_text,
+            dump_ids([script_id]),
+        ),
+    )
+
+
 def analyze_script_into_project(project_id: str, script_id: str) -> dict[str, Any]:
     project = get_project(project_id)
     script = get_script(script_id)
@@ -569,37 +661,83 @@ def analyze_script_into_project(project_id: str, script_id: str) -> dict[str, An
     entities = guess_entities(script["content"])
     with connect() as conn:
         conn.execute("UPDATE project_scripts SET status = ?, updated_at = ? WHERE id = ?", ("analyzing", now, script_id))
-        node_ids: list[str] = []
+        entity_node_ids: dict[str, str] = {}
         for index, item in enumerate(entities):
             entity_id = upsert_entity(conn, project_id, script_id, item, script["content"])
-            node_ids.append(upsert_graph_node(conn, project_id, script_id, item, entity_id, index))
-        for index in range(max(0, len(node_ids) - 1)):
-            exists = conn.execute(
-                """
-                SELECT id FROM graph_edges
-                WHERE project_id = ? AND source_node_id = ? AND target_node_id = ?
-                """,
-                (project_id, node_ids[index], node_ids[index + 1]),
-            ).fetchone()
-            if exists:
-                continue
-            conn.execute(
-                """
-                INSERT INTO graph_edges (
-                    id, project_id, source_node_id, target_node_id, relation,
-                    description, source_text, source_script_ids
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    str(uuid.uuid4()),
+            entity_node_ids[item["name"]] = upsert_graph_node(conn, project_id, script_id, item, entity_id, index)
+
+        previous_event_id: str | None = None
+        sentences = split_sentences(script["content"])
+        for sentence_index, sentence in enumerate(sentences, start=1):
+            event_id = insert_event_node(conn, project_id, script_id, script["title"], sentence, sentence_index)
+            if previous_event_id:
+                insert_graph_edge(
+                    conn,
                     project_id,
-                    node_ids[index],
-                    node_ids[index + 1],
-                    "关联",
-                    "所选剧幕中存在连续叙事关联。",
-                    script["content"][:180],
-                    dump_ids([script_id]),
-                ),
+                    previous_event_id,
+                    event_id,
+                    "然后",
+                    "两个事件在剧幕中按顺序连续发生。",
+                    sentence,
+                    script_id,
+                )
+            previous_event_id = event_id
+
+            matched_entities = [item for item in entities if item["name"] in sentence]
+            if not matched_entities:
+                matched_entities = [item for item in entities[:2] if item["type"] in {"character", "scene"}]
+            for item in matched_entities:
+                node_id = entity_node_ids.get(item["name"])
+                if not node_id:
+                    continue
+                relation = {
+                    "character": "参与",
+                    "scene": "发生于",
+                    "object": "关联道具",
+                    "concept": "表达",
+                }.get(item["type"], "关联")
+                insert_graph_edge(
+                    conn,
+                    project_id,
+                    node_id,
+                    event_id,
+                    relation,
+                    f"{item['name']} 与该叙事事件存在“{relation}”关系。",
+                    sentence,
+                    script_id,
+                )
+
+        entity_items = list(entities)
+        for left_index, left in enumerate(entity_items):
+            for right in entity_items[left_index + 1 :]:
+                if left["type"] == right["type"]:
+                    continue
+                if left["name"] not in script["content"] or right["name"] not in script["content"]:
+                    continue
+                left_node = entity_node_ids.get(left["name"])
+                right_node = entity_node_ids.get(right["name"])
+                if left_node and right_node:
+                    insert_graph_edge(
+                        conn,
+                        project_id,
+                        left_node,
+                        right_node,
+                        "共现",
+                        "两个实体在同一剧幕中共同出现。",
+                        script["content"][:180],
+                        script_id,
+                    )
+
+        nodes = conn.execute("SELECT id, type FROM graph_nodes WHERE project_id = ? ORDER BY rowid", (project_id,)).fetchall()
+        type_offsets = {"character": 110, "object": 230, "scene": 350, "event": 470, "concept": 590}
+        type_counts: dict[str, int] = {}
+        for node in nodes:
+            node_type = node["type"]
+            count = type_counts.get(node_type, 0)
+            type_counts[node_type] = count + 1
+            conn.execute(
+                "UPDATE graph_nodes SET x = ?, y = ? WHERE id = ?",
+                (120 + 165 * count, type_offsets.get(node_type, 640), node["id"]),
             )
         conn.execute("UPDATE project_scripts SET status = ?, updated_at = ? WHERE id = ?", ("analyzed", now, script_id))
         conn.execute(
@@ -1080,6 +1218,36 @@ async def upload_reference_image(entity_id: str, file: UploadFile = File(...)) -
         if is_main:
             conn.execute("UPDATE entities SET main_image_id = ?, status = ?, updated_at = ? WHERE id = ?", (image_id, "image_ready", now, entity_id))
     return entity_with_images(entity_id)
+
+
+@app.delete("/api/entity-images/{image_id}")
+def delete_entity_image(image_id: str) -> dict[str, Any]:
+    with connect() as conn:
+        image = row_to_dict(conn.execute("SELECT * FROM entity_images WHERE id = ?", (image_id,)).fetchone())
+        if not image:
+            raise HTTPException(status_code=404, detail="Image not found")
+        entity = row_to_dict(conn.execute("SELECT * FROM entities WHERE id = ?", (image["entity_id"],)).fetchone())
+        if not entity:
+            raise HTTPException(status_code=404, detail="Entity not found")
+        conn.execute("DELETE FROM entity_images WHERE id = ?", (image_id,))
+        replacement = conn.execute(
+            "SELECT id FROM entity_images WHERE entity_id = ? ORDER BY created_at DESC LIMIT 1",
+            (image["entity_id"],),
+        ).fetchone()
+        if entity.get("main_image_id") == image_id:
+            conn.execute(
+                "UPDATE entities SET main_image_id = ?, status = ?, updated_at = ? WHERE id = ?",
+                (
+                    replacement["id"] if replacement else None,
+                    "image_ready" if replacement else "image_pending",
+                    now_iso(),
+                    image["entity_id"],
+                ),
+            )
+    file_path = Path(image["file_path"])
+    if file_path.exists() and file_path.resolve().is_relative_to(DATA_DIR):
+        file_path.unlink()
+    return entity_with_images(image["entity_id"])
 
 
 @app.post("/api/projects/{project_id}/frames/generate")
