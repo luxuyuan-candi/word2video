@@ -18,6 +18,11 @@ textarea {
   font: inherit;
 }
 
+input[type="radio"] {
+  width: auto;
+  accent-color: #2563eb;
+}
+
 button {
   cursor: pointer;
 }
@@ -135,6 +140,36 @@ button:disabled {
 .history-item {
   margin-bottom: 8px;
   padding: 10px;
+}
+
+.script-list {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 10px;
+  margin-bottom: 16px;
+}
+
+.script-item {
+  border: 1px solid #dbe3ef;
+  border-radius: 8px;
+  background: #ffffff;
+  padding: 12px;
+  color: inherit;
+  text-align: left;
+}
+
+.script-item.active {
+  border-color: #2563eb;
+  background: #eff6ff;
+}
+
+.script-item strong,
+.script-item small {
+  display: block;
+}
+
+.script-item small {
+  color: #64748b;
 }
 
 .workspace {
@@ -314,6 +349,11 @@ textarea:focus {
   stroke-width: 3;
 }
 
+.graph-node.changed circle {
+  fill: #ecfdf5;
+  stroke: #16a34a;
+}
+
 .graph-node text {
   fill: #172033;
   font-size: 14px;
@@ -399,6 +439,31 @@ textarea:focus {
 .frame-list {
   display: grid;
   gap: 14px;
+}
+
+.scope-bar {
+  display: flex;
+  align-items: center;
+  gap: 18px;
+  border: 1px solid #dbe3ef;
+  border-radius: 8px;
+  background: #f8fbff;
+  padding: 12px;
+  margin-bottom: 16px;
+}
+
+.scope-bar label {
+  display: flex;
+  grid-auto-flow: column;
+  grid-template-columns: auto auto;
+  align-items: center;
+  gap: 8px;
+  font-weight: 800;
+}
+
+.scope-bar span {
+  margin-left: auto;
+  color: #64748b;
 }
 
 .frame-index {

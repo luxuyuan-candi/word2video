@@ -8,10 +8,10 @@ import uuid
 import zipfile
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi import FastAPI, File, HTTPException, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
@@ -22,6 +22,8 @@ from pydantic_settings import BaseSettings
 BACKEND_DIR = Path(__file__).resolve().parents[1]
 REPO_DIR = Path(__file__).resolve().parents[2]
 load_dotenv(BACKEND_DIR / ".env")
+
+FrameScope = Literal["current_script", "all_scripts"]
 
 
 class Settings(BaseSettings):
@@ -65,8 +67,7 @@ def database_path() -> Path:
     prefix = "sqlite:///"
     if not settings.database_url.startswith(prefix):
         raise RuntimeError("Only sqlite:/// DATABASE_URL is supported for local deployment.")
-    raw = settings.database_url.removeprefix(prefix)
-    return resolve_path(raw)
+    return resolve_path(settings.database_url.removeprefix(prefix))
 
 
 DB_PATH = database_path()
@@ -88,6 +89,16 @@ def connect() -> sqlite3.Connection:
     return conn
 
 
+def column_exists(conn: sqlite3.Connection, table: str, column: str) -> bool:
+    rows = conn.execute(f"PRAGMA table_info({table})").fetchall()
+    return any(row["name"] == column for row in rows)
+
+
+def add_column_if_missing(conn: sqlite3.Connection, table: str, column: str, definition: str) -> None:
+    if not column_exists(conn, table, column):
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+
+
 def init_db() -> None:
     ensure_directories()
     with connect() as conn:
@@ -96,13 +107,29 @@ def init_db() -> None:
             CREATE TABLE IF NOT EXISTS projects (
                 id TEXT PRIMARY KEY,
                 title TEXT NOT NULL,
-                script TEXT NOT NULL,
+                script TEXT NOT NULL DEFAULT '',
                 content_type TEXT,
+                active_script_id TEXT,
                 status TEXT NOT NULL,
                 progress INTEGER NOT NULL DEFAULT 0,
                 error_message TEXT,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS project_scripts (
+                id TEXT PRIMARY KEY,
+                project_id TEXT NOT NULL,
+                title TEXT NOT NULL,
+                content TEXT NOT NULL,
+                content_type TEXT,
+                order_index INTEGER NOT NULL DEFAULT 1,
+                status TEXT NOT NULL DEFAULT 'draft',
+                word_count INTEGER NOT NULL DEFAULT 0,
+                error_message TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE
             );
 
             CREATE TABLE IF NOT EXISTS graph_nodes (
@@ -112,6 +139,8 @@ def init_db() -> None:
                 name TEXT NOT NULL,
                 description TEXT NOT NULL,
                 source_text TEXT,
+                source_script_ids TEXT NOT NULL DEFAULT '[]',
+                change_state TEXT NOT NULL DEFAULT 'existing',
                 entity_id TEXT,
                 x REAL NOT NULL DEFAULT 0,
                 y REAL NOT NULL DEFAULT 0,
@@ -126,6 +155,7 @@ def init_db() -> None:
                 relation TEXT NOT NULL,
                 description TEXT,
                 source_text TEXT,
+                source_script_ids TEXT NOT NULL DEFAULT '[]',
                 FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE
             );
 
@@ -139,6 +169,8 @@ def init_db() -> None:
                 prompt TEXT,
                 status TEXT NOT NULL,
                 main_image_id TEXT,
+                source_script_ids TEXT NOT NULL DEFAULT '[]',
+                merge_candidate_ids TEXT NOT NULL DEFAULT '[]',
                 occurrence_count INTEGER NOT NULL DEFAULT 1,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
@@ -161,6 +193,9 @@ def init_db() -> None:
             CREATE TABLE IF NOT EXISTS frames (
                 id TEXT PRIMARY KEY,
                 project_id TEXT NOT NULL,
+                script_id TEXT,
+                script_title TEXT,
+                scope TEXT NOT NULL DEFAULT 'current_script',
                 frame_index INTEGER NOT NULL,
                 source_text TEXT NOT NULL,
                 description TEXT NOT NULL,
@@ -177,19 +212,84 @@ def init_db() -> None:
             CREATE TABLE IF NOT EXISTS exports (
                 id TEXT PRIMARY KEY,
                 project_id TEXT NOT NULL,
+                script_id TEXT,
+                scope TEXT NOT NULL DEFAULT 'current_script',
                 file_url TEXT NOT NULL,
                 file_path TEXT NOT NULL,
+                frame_count INTEGER NOT NULL DEFAULT 0,
                 created_at TEXT NOT NULL,
                 FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE
             );
             """
         )
+        for table, columns in {
+            "projects": [("active_script_id", "TEXT")],
+            "graph_nodes": [("source_script_ids", "TEXT NOT NULL DEFAULT '[]'"), ("change_state", "TEXT NOT NULL DEFAULT 'existing'")],
+            "graph_edges": [("source_script_ids", "TEXT NOT NULL DEFAULT '[]'")],
+            "entities": [("source_script_ids", "TEXT NOT NULL DEFAULT '[]'"), ("merge_candidate_ids", "TEXT NOT NULL DEFAULT '[]'")],
+            "frames": [("script_id", "TEXT"), ("script_title", "TEXT"), ("scope", "TEXT NOT NULL DEFAULT 'current_script'")],
+            "exports": [("script_id", "TEXT"), ("scope", "TEXT NOT NULL DEFAULT 'current_script'"), ("frame_count", "INTEGER NOT NULL DEFAULT 0")],
+        }.items():
+            for column, definition in columns:
+                add_column_if_missing(conn, table, column, definition)
+        backfill_scripts(conn)
+
+
+def backfill_scripts(conn: sqlite3.Connection) -> None:
+    now = now_iso()
+    projects = conn.execute("SELECT * FROM projects").fetchall()
+    for project in projects:
+        count = conn.execute("SELECT COUNT(*) FROM project_scripts WHERE project_id = ?", (project["id"],)).fetchone()[0]
+        if count:
+            continue
+        script = project["script"] or ""
+        if not script:
+            continue
+        script_id = str(uuid.uuid4())
+        conn.execute(
+            """
+            INSERT INTO project_scripts (
+                id, project_id, title, content, content_type, order_index, status,
+                word_count, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                script_id,
+                project["id"],
+                clean_title(script),
+                script,
+                project["content_type"],
+                1,
+                "draft",
+                len(script),
+                project["created_at"] or now,
+                now,
+            ),
+        )
+        conn.execute("UPDATE projects SET active_script_id = ? WHERE id = ?", (script_id, project["id"]))
 
 
 class ProjectCreate(BaseModel):
     title: str | None = None
+    script_title: str | None = None
     script: str = Field(min_length=20)
     content_type: str | None = None
+
+
+class ScriptCreate(BaseModel):
+    title: str | None = None
+    content: str = Field(min_length=20)
+    content_type: str | None = None
+
+
+class ScriptUpdate(BaseModel):
+    title: str | None = None
+    content: str | None = None
+    content_type: str | None = None
+
+
+class ActiveScriptUpdate(BaseModel):
+    script_id: str
 
 
 class EntityUpdate(BaseModel):
@@ -202,8 +302,17 @@ class EntityUpdate(BaseModel):
     main_image_id: str | None = None
 
 
+class EntityMerge(BaseModel):
+    target_entity_id: str
+
+
 class EntityImageCreate(BaseModel):
     prompt: str | None = None
+
+
+class FrameGenerate(BaseModel):
+    scope: FrameScope = "current_script"
+    script_id: str | None = None
 
 
 class FrameUpdate(BaseModel):
@@ -211,6 +320,11 @@ class FrameUpdate(BaseModel):
     camera: str | None = None
     mood: str | None = None
     entity_ids: list[str] | None = None
+
+
+class ExportCreate(BaseModel):
+    scope: FrameScope = "current_script"
+    script_id: str | None = None
 
 
 def row_to_dict(row: sqlite3.Row | None) -> dict[str, Any] | None:
@@ -222,12 +336,60 @@ def list_rows(query: str, params: tuple[Any, ...] = ()) -> list[dict[str, Any]]:
         return [dict(row) for row in conn.execute(query, params).fetchall()]
 
 
+def scalar(query: str, params: tuple[Any, ...] = ()) -> int:
+    with connect() as conn:
+        value = conn.execute(query, params).fetchone()[0]
+    return int(value or 0)
+
+
+def json_list(value: Any) -> list[str]:
+    if not value:
+        return []
+    if isinstance(value, list):
+        return value
+    try:
+        parsed = json.loads(value)
+        return parsed if isinstance(parsed, list) else []
+    except json.JSONDecodeError:
+        return []
+
+
+def dump_ids(values: list[str]) -> str:
+    return json.dumps(sorted(set(values)), ensure_ascii=False)
+
+
+def clean_title(script: str) -> str:
+    first = re.sub(r"\s+", " ", script.strip()).strip()
+    return first[:24] or "未命名剧本"
+
+
+def split_script(script: str) -> list[str]:
+    pieces = re.split(r"(?<=[。！？.!?])\s*|\n+", script)
+    cleaned = [piece.strip() for piece in pieces if piece and piece.strip()]
+    if len(cleaned) <= 1:
+        cleaned = [script.strip()[i : i + 90] for i in range(0, len(script.strip()), 90)]
+    return cleaned[:24]
+
+
+def storage_url(path: Path) -> str:
+    relative = path.resolve().relative_to(DATA_DIR)
+    return "/storage/" + relative.as_posix()
+
+
+def get_script(script_id: str) -> dict[str, Any]:
+    with connect() as conn:
+        script = row_to_dict(conn.execute("SELECT * FROM project_scripts WHERE id = ?", (script_id,)).fetchone())
+    if not script:
+        raise HTTPException(status_code=404, detail="Script not found")
+    return script
+
+
 def get_project(project_id: str) -> dict[str, Any]:
     with connect() as conn:
-        row = conn.execute("SELECT * FROM projects WHERE id = ?", (project_id,)).fetchone()
-    project = row_to_dict(row)
+        project = row_to_dict(conn.execute("SELECT * FROM projects WHERE id = ?", (project_id,)).fetchone())
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
+    project["script_count"] = scalar("SELECT COUNT(*) FROM project_scripts WHERE project_id = ?", (project_id,))
     project["entity_count"] = scalar("SELECT COUNT(*) FROM entities WHERE project_id = ?", (project_id,))
     project["completed_entity_image_count"] = scalar(
         "SELECT COUNT(*) FROM entities WHERE project_id = ? AND main_image_id IS NOT NULL",
@@ -237,30 +399,35 @@ def get_project(project_id: str) -> dict[str, Any]:
     return project
 
 
-def scalar(query: str, params: tuple[Any, ...] = ()) -> int:
-    with connect() as conn:
-        value = conn.execute(query, params).fetchone()[0]
-    return int(value or 0)
+def get_scripts(project_id: str) -> list[dict[str, Any]]:
+    return list_rows("SELECT * FROM project_scripts WHERE project_id = ? ORDER BY order_index, created_at", (project_id,))
 
 
-def clean_title(script: str) -> str:
-    first = re.sub(r"\s+", " ", script.strip()).strip()
-    return first[:24] or "Untitled project"
+def choose_script(project: dict[str, Any], script_id: str | None = None) -> dict[str, Any]:
+    selected_id = script_id or project.get("active_script_id")
+    if not selected_id:
+        scripts = get_scripts(project["id"])
+        if not scripts:
+            raise HTTPException(status_code=400, detail="Project has no script")
+        return scripts[0]
+    script = get_script(selected_id)
+    if script["project_id"] != project["id"]:
+        raise HTTPException(status_code=400, detail="Script does not belong to project")
+    return script
 
 
-def split_script(script: str) -> list[str]:
-    pieces = re.split(r"(?<=[。！？.!?])\s*|\n+", script)
-    cleaned = [piece.strip() for piece in pieces if piece and piece.strip()]
-    if len(cleaned) <= 1:
-        cleaned = [script.strip()[i : i + 90] for i in range(0, len(script.strip()), 90)]
-    return cleaned[:12]
+def get_scripts_for_scope(project_id: str, scope: FrameScope, script_id: str | None = None) -> list[dict[str, Any]]:
+    project = get_project(project_id)
+    if scope == "current_script":
+        return [choose_script(project, script_id)]
+    return get_scripts(project_id)
 
 
 def guess_entities(script: str) -> list[dict[str, str]]:
     patterns = [
-        ("character", ["小明", "小红", "少年", "女孩", "男孩", "老师", "主角", "老人", "女孩"]),
-        ("object", ["钥匙", "手机", "盒子", "书", "信", "机器", "产品", "背包", "手表"]),
-        ("scene", ["城市", "房间", "办公室", "学校", "街道", "森林", "海边", "实验室", "广场"]),
+        ("character", ["小明", "小红", "少年", "女孩", "男孩", "老师", "主角", "老人", "摄影师"]),
+        ("object", ["钥匙", "手机", "盒子", "书", "信", "机器", "产品", "背包", "手表", "相机"]),
+        ("scene", ["城市", "房间", "办公室", "学校", "街道", "森林", "海边", "实验室", "广场", "天台", "书店"]),
     ]
     found: list[dict[str, str]] = []
     for entity_type, words in patterns:
@@ -281,7 +448,7 @@ def guess_entities(script: str) -> list[dict[str, str]]:
         ]
     if not any(item["type"] == "concept" for item in found):
         found.append({"name": "核心情绪", "type": "concept", "description": "贯穿剧本的画面氛围和情绪主题。"})
-    return found[:10]
+    return found[:12]
 
 
 def default_prompt(entity: dict[str, Any]) -> str:
@@ -294,80 +461,145 @@ def default_prompt(entity: dict[str, Any]) -> str:
     return f"{type_label}, {entity['name']}, {entity['description']}, high detail, neutral background"
 
 
-def create_project_graph(project_id: str, script: str) -> None:
+def upsert_entity(conn: sqlite3.Connection, project_id: str, script_id: str, item: dict[str, str], script: str) -> str:
     now = now_iso()
-    entities = guess_entities(script)
+    existing = conn.execute(
+        "SELECT * FROM entities WHERE project_id = ? AND lower(name) = lower(?)",
+        (project_id, item["name"]),
+    ).fetchone()
+    if existing:
+        ids = json_list(existing["source_script_ids"])
+        ids.append(script_id)
+        occurrence_count = int(existing["occurrence_count"] or 0) + max(1, script.count(item["name"]))
+        conn.execute(
+            """
+            UPDATE entities
+            SET source_script_ids = ?, occurrence_count = ?, updated_at = ?
+            WHERE id = ?
+            """,
+            (dump_ids(ids), occurrence_count, now, existing["id"]),
+        )
+        return existing["id"]
+
+    entity_id = str(uuid.uuid4())
+    prompt = default_prompt(item)
+    conn.execute(
+        """
+        INSERT INTO entities (
+            id, project_id, name, type, description, visual_description, prompt,
+            status, source_script_ids, occurrence_count, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            entity_id,
+            project_id,
+            item["name"],
+            item["type"],
+            item["description"],
+            item["description"],
+            prompt,
+            "image_pending",
+            dump_ids([script_id]),
+            max(1, script.count(item["name"])),
+            now,
+            now,
+        ),
+    )
+    return entity_id
+
+
+def upsert_graph_node(
+    conn: sqlite3.Connection,
+    project_id: str,
+    script_id: str,
+    item: dict[str, str],
+    entity_id: str,
+    index: int,
+) -> str:
+    existing = conn.execute(
+        "SELECT * FROM graph_nodes WHERE project_id = ? AND entity_id = ?",
+        (project_id, entity_id),
+    ).fetchone()
+    if existing:
+        ids = json_list(existing["source_script_ids"])
+        ids.append(script_id)
+        conn.execute(
+            "UPDATE graph_nodes SET source_script_ids = ?, change_state = ? WHERE id = ?",
+            (dump_ids(ids), "updated", existing["id"]),
+        )
+        return existing["id"]
+    node_id = str(uuid.uuid4())
+    conn.execute(
+        """
+        INSERT INTO graph_nodes (
+            id, project_id, type, name, description, source_text, source_script_ids,
+            change_state, entity_id, x, y
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            node_id,
+            project_id,
+            item["type"],
+            item["name"],
+            item["description"],
+            item["name"],
+            dump_ids([script_id]),
+            "new",
+            entity_id,
+            160 + 180 * (index % 4),
+            140 + 125 * (index // 4),
+        ),
+    )
+    return node_id
+
+
+def analyze_script_into_project(project_id: str, script_id: str) -> dict[str, Any]:
+    project = get_project(project_id)
+    script = get_script(script_id)
+    if script["project_id"] != project_id:
+        raise HTTPException(status_code=400, detail="Script does not belong to project")
+    now = now_iso()
+    entities = guess_entities(script["content"])
     with connect() as conn:
-        conn.execute("DELETE FROM graph_edges WHERE project_id = ?", (project_id,))
-        conn.execute("DELETE FROM graph_nodes WHERE project_id = ?", (project_id,))
-        conn.execute("DELETE FROM entities WHERE project_id = ?", (project_id,))
-        entity_records: list[dict[str, Any]] = []
+        conn.execute("UPDATE project_scripts SET status = ?, updated_at = ? WHERE id = ?", ("analyzing", now, script_id))
+        node_ids: list[str] = []
         for index, item in enumerate(entities):
-            entity_id = str(uuid.uuid4())
-            prompt = default_prompt(item)
-            entity_records.append({**item, "id": entity_id, "prompt": prompt})
-            conn.execute(
+            entity_id = upsert_entity(conn, project_id, script_id, item, script["content"])
+            node_ids.append(upsert_graph_node(conn, project_id, script_id, item, entity_id, index))
+        for index in range(max(0, len(node_ids) - 1)):
+            exists = conn.execute(
                 """
-                INSERT INTO entities (
-                    id, project_id, name, type, description, visual_description, prompt,
-                    status, occurrence_count, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                SELECT id FROM graph_edges
+                WHERE project_id = ? AND source_node_id = ? AND target_node_id = ?
                 """,
-                (
-                    entity_id,
-                    project_id,
-                    item["name"],
-                    item["type"],
-                    item["description"],
-                    item["description"],
-                    prompt,
-                    "image_pending",
-                    max(1, script.count(item["name"])),
-                    now,
-                    now,
-                ),
-            )
-            angle = index * 360 / max(1, len(entities))
-            conn.execute(
-                """
-                INSERT INTO graph_nodes (
-                    id, project_id, type, name, description, source_text, entity_id, x, y
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    str(uuid.uuid4()),
-                    project_id,
-                    item["type"],
-                    item["name"],
-                    item["description"],
-                    item["name"],
-                    entity_id,
-                    340 + 220 * (index % 3),
-                    160 + 130 * (index // 3),
-                ),
-            )
-        nodes = conn.execute("SELECT * FROM graph_nodes WHERE project_id = ?", (project_id,)).fetchall()
-        for index in range(max(0, len(nodes) - 1)):
+                (project_id, node_ids[index], node_ids[index + 1]),
+            ).fetchone()
+            if exists:
+                continue
             conn.execute(
                 """
                 INSERT INTO graph_edges (
-                    id, project_id, source_node_id, target_node_id, relation, description, source_text
-                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    id, project_id, source_node_id, target_node_id, relation,
+                    description, source_text, source_script_ids
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     str(uuid.uuid4()),
                     project_id,
-                    nodes[index]["id"],
-                    nodes[index + 1]["id"],
+                    node_ids[index],
+                    node_ids[index + 1],
                     "关联",
-                    f"{nodes[index]['name']} 与 {nodes[index + 1]['name']} 在剧本中存在叙事关联。",
-                    script[:160],
+                    "当前剧本中存在连续叙事关联。",
+                    script["content"][:180],
+                    dump_ids([script_id]),
                 ),
             )
+        conn.execute("UPDATE project_scripts SET status = ?, updated_at = ? WHERE id = ?", ("analyzed", now, script_id))
         conn.execute(
-            "UPDATE projects SET status = ?, progress = ?, updated_at = ? WHERE id = ?",
-            ("graph_ready", 45, now, project_id),
+            "UPDATE projects SET active_script_id = ?, status = ?, progress = ?, updated_at = ? WHERE id = ?",
+            (script_id, "graph_ready", 45, now, project_id),
         )
+    return project_detail(project_id)
 
 
 def entity_with_images(entity_id: str) -> dict[str, Any]:
@@ -375,19 +607,20 @@ def entity_with_images(entity_id: str) -> dict[str, Any]:
         entity = row_to_dict(conn.execute("SELECT * FROM entities WHERE id = ?", (entity_id,)).fetchone())
         if not entity:
             raise HTTPException(status_code=404, detail="Entity not found")
-        images = [
-            dict(row)
-            for row in conn.execute(
-                "SELECT * FROM entity_images WHERE entity_id = ? ORDER BY created_at DESC", (entity_id,)
-            ).fetchall()
-        ]
-    entity["images"] = images
+        images = [dict(row) for row in conn.execute("SELECT * FROM entity_images WHERE entity_id = ? ORDER BY created_at DESC", (entity_id,))]
+    return normalize_entity({**entity, "images": images})
+
+
+def normalize_entity(entity: dict[str, Any]) -> dict[str, Any]:
+    entity["source_script_ids"] = json_list(entity.get("source_script_ids"))
+    entity["source_script_count"] = len(entity["source_script_ids"])
+    entity["merge_candidate_ids"] = json_list(entity.get("merge_candidate_ids"))
+    entity.setdefault("images", [])
     return entity
 
 
 def create_svg_image(entity: dict[str, Any], prompt: str, image_id: str) -> Path:
-    project_id = entity["project_id"]
-    target_dir = GENERATED_DIR / project_id / entity["id"]
+    target_dir = GENERATED_DIR / entity["project_id"] / entity["id"]
     target_dir.mkdir(parents=True, exist_ok=True)
     target = target_dir / f"{image_id}.svg"
     colors = {
@@ -397,8 +630,8 @@ def create_svg_image(entity: dict[str, Any], prompt: str, image_id: str) -> Path
         "concept": ("#ea580c", "#ffedd5"),
     }
     primary, bg = colors.get(entity["type"], ("#475569", "#f8fafc"))
-    safe_name = entity["name"].replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-    safe_prompt = prompt[:120].replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    safe_name = escape_xml(entity["name"])
+    safe_prompt = escape_xml(prompt[:120])
     svg = f"""<svg xmlns="http://www.w3.org/2000/svg" width="960" height="640" viewBox="0 0 960 640">
   <rect width="960" height="640" fill="{bg}"/>
   <circle cx="480" cy="248" r="136" fill="{primary}" opacity="0.16"/>
@@ -411,23 +644,25 @@ def create_svg_image(entity: dict[str, Any], prompt: str, image_id: str) -> Path
     return target
 
 
-def storage_url(path: Path) -> str:
-    relative = path.resolve().relative_to(DATA_DIR)
-    return "/storage/" + relative.as_posix()
+def escape_xml(value: str) -> str:
+    return value.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
 def get_graph(project_id: str) -> dict[str, Any]:
     nodes = list_rows("SELECT * FROM graph_nodes WHERE project_id = ? ORDER BY rowid", (project_id,))
     edges = list_rows("SELECT * FROM graph_edges WHERE project_id = ? ORDER BY rowid", (project_id,))
+    for node in nodes:
+        node["source_script_ids"] = json_list(node.get("source_script_ids"))
+    for edge in edges:
+        edge["source_script_ids"] = json_list(edge.get("source_script_ids"))
     return {"nodes": nodes, "edges": edges}
 
 
 def get_entities(project_id: str) -> list[dict[str, Any]]:
     entities = list_rows("SELECT * FROM entities WHERE project_id = ? ORDER BY type, name", (project_id,))
     for entity in entities:
-        entity["images"] = list_rows(
-            "SELECT * FROM entity_images WHERE entity_id = ? ORDER BY created_at DESC", (entity["id"],)
-        )
+        entity["images"] = list_rows("SELECT * FROM entity_images WHERE entity_id = ? ORDER BY created_at DESC", (entity["id"],))
+        normalize_entity(entity)
     return entities
 
 
@@ -437,67 +672,86 @@ def build_frame_prompt(description: str, entity_names: list[str], refs: list[str
     return f"{description}\nReferenced entities: {names}\nReference images: {references}"
 
 
-def generate_frames(project_id: str) -> list[dict[str, Any]]:
-    project = get_project(project_id)
+def generate_frames(project_id: str, scope: FrameScope, script_id: str | None = None) -> list[dict[str, Any]]:
+    scripts = get_scripts_for_scope(project_id, scope, script_id)
     entities = get_entities(project_id)
-    chunks = split_script(project["script"])
     now = now_iso()
     with connect() as conn:
-        conn.execute("DELETE FROM frames WHERE project_id = ?", (project_id,))
-        for index, source in enumerate(chunks, start=1):
-            related = [entity for entity in entities if entity["name"] in source] or entities[: min(3, len(entities))]
-            entity_ids = [entity["id"] for entity in related]
-            image_ids: list[str] = []
-            image_urls: list[str] = []
-            names: list[str] = []
-            for entity in related:
-                names.append(entity["name"])
-                if entity.get("main_image_id"):
-                    image_ids.append(entity["main_image_id"])
-                    image = conn.execute(
-                        "SELECT image_url FROM entity_images WHERE id = ?", (entity["main_image_id"],)
-                    ).fetchone()
-                    if image:
-                        image_urls.append(image["image_url"])
-            description = f"第 {index} 帧：{source}。画面需要突出 {', '.join(names) if names else '核心情绪'}。"
-            prompt = build_frame_prompt(description, names, image_urls)
-            conn.execute(
-                """
-                INSERT INTO frames (
-                    id, project_id, frame_index, source_text, description, camera, mood,
-                    entity_ids, reference_image_ids, prompt, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    str(uuid.uuid4()),
-                    project_id,
-                    index,
-                    source,
-                    description,
-                    "中景，稳定镜头",
-                    "cinematic, coherent, story-driven",
-                    json.dumps(entity_ids, ensure_ascii=False),
-                    json.dumps(image_ids, ensure_ascii=False),
-                    prompt,
-                    now,
-                    now,
-                ),
-            )
-        conn.execute(
-            "UPDATE projects SET status = ?, progress = ?, updated_at = ? WHERE id = ?",
-            ("frames_ready", 85, now, project_id),
-        )
-    return get_frames(project_id)
+        if scope == "current_script":
+            conn.execute("DELETE FROM frames WHERE project_id = ? AND scope = ? AND script_id = ?", (project_id, scope, scripts[0]["id"]))
+        else:
+            conn.execute("DELETE FROM frames WHERE project_id = ? AND scope = ?", (project_id, scope))
+        frame_index = 1
+        for script in scripts:
+            chunks = split_script(script["content"])
+            for source in chunks:
+                related = [entity for entity in entities if entity["name"] in source] or entities[: min(3, len(entities))]
+                entity_ids = [entity["id"] for entity in related]
+                image_ids: list[str] = []
+                image_urls: list[str] = []
+                names: list[str] = []
+                for entity in related:
+                    names.append(entity["name"])
+                    if entity.get("main_image_id"):
+                        image_ids.append(entity["main_image_id"])
+                        image = conn.execute("SELECT image_url FROM entity_images WHERE id = ?", (entity["main_image_id"],)).fetchone()
+                        if image:
+                            image_urls.append(image["image_url"])
+                description = f"第 {frame_index} 帧：{source}。画面需要突出 {', '.join(names) if names else '核心情绪'}。"
+                prompt = build_frame_prompt(description, names, image_urls)
+                conn.execute(
+                    """
+                    INSERT INTO frames (
+                        id, project_id, script_id, script_title, scope, frame_index, source_text,
+                        description, camera, mood, entity_ids, reference_image_ids,
+                        prompt, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        str(uuid.uuid4()),
+                        project_id,
+                        script["id"],
+                        script["title"],
+                        scope,
+                        frame_index,
+                        source,
+                        description,
+                        "中景，稳定镜头",
+                        "cinematic, coherent, story-driven",
+                        json.dumps(entity_ids, ensure_ascii=False),
+                        json.dumps(image_ids, ensure_ascii=False),
+                        prompt,
+                        now,
+                        now,
+                    ),
+                )
+                frame_index += 1
+        conn.execute("UPDATE projects SET status = ?, progress = ?, updated_at = ? WHERE id = ?", ("frames_ready", 85, now, project_id))
+    return get_frames(project_id, scope, scripts[0]["id"] if scope == "current_script" else None)
 
 
-def get_frames(project_id: str) -> list[dict[str, Any]]:
-    frames = list_rows("SELECT * FROM frames WHERE project_id = ? ORDER BY frame_index", (project_id,))
+def get_frames(project_id: str, scope: FrameScope | None = None, script_id: str | None = None) -> list[dict[str, Any]]:
+    query = "SELECT * FROM frames WHERE project_id = ?"
+    params: list[Any] = [project_id]
+    if scope:
+        query += " AND scope = ?"
+        params.append(scope)
+    if script_id:
+        query += " AND script_id = ?"
+        params.append(script_id)
+    query += " ORDER BY scope, frame_index"
+    frames = list_rows(query, tuple(params))
     entities = {entity["id"]: entity for entity in get_entities(project_id)}
     for frame in frames:
-        frame["entity_ids"] = json.loads(frame["entity_ids"])
-        frame["reference_image_ids"] = json.loads(frame["reference_image_ids"])
+        frame["entity_ids"] = json_list(frame["entity_ids"])
+        frame["reference_image_ids"] = json_list(frame["reference_image_ids"])
         frame["entities"] = [entities[eid] for eid in frame["entity_ids"] if eid in entities]
     return frames
+
+
+def safe_filename(value: str) -> str:
+    cleaned = re.sub(r"[^\w\-.一-龥]+", "_", value, flags=re.UNICODE).strip("_")
+    return cleaned[:60] or "asset"
 
 
 app = FastAPI(title=settings.app_name)
@@ -528,17 +782,30 @@ def health() -> dict[str, str]:
 @app.post("/api/projects")
 def create_project(payload: ProjectCreate) -> dict[str, Any]:
     project_id = str(uuid.uuid4())
+    script_id = str(uuid.uuid4())
     title = payload.title or clean_title(payload.script)
+    script_title = payload.script_title or clean_title(payload.script)
     now = now_iso()
     with connect() as conn:
         conn.execute(
             """
-            INSERT INTO projects (id, title, script, content_type, status, progress, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO projects (
+                id, title, script, content_type, active_script_id, status,
+                progress, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            (project_id, title, payload.script, payload.content_type, "draft", 10, now, now),
+            (project_id, title, payload.script, payload.content_type, script_id, "draft", 10, now, now),
         )
-    return get_project(project_id)
+        conn.execute(
+            """
+            INSERT INTO project_scripts (
+                id, project_id, title, content, content_type, order_index, status,
+                word_count, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (script_id, project_id, script_title, payload.script, payload.content_type, 1, "draft", len(payload.script), now, now),
+        )
+    return project_detail(project_id)
 
 
 @app.get("/api/projects")
@@ -550,6 +817,9 @@ def list_projects() -> list[dict[str, Any]]:
 @app.get("/api/projects/{project_id}")
 def project_detail(project_id: str) -> dict[str, Any]:
     project = get_project(project_id)
+    active_script = get_script(project["active_script_id"]) if project.get("active_script_id") else None
+    project["active_script"] = active_script
+    project["scripts"] = get_scripts(project_id)
     project["graph"] = get_graph(project_id)
     project["entities"] = get_entities(project_id)
     project["frames"] = get_frames(project_id)
@@ -557,16 +827,91 @@ def project_detail(project_id: str) -> dict[str, Any]:
     return project
 
 
-@app.post("/api/projects/{project_id}/analyze")
-def analyze_project(project_id: str) -> dict[str, Any]:
-    project = get_project(project_id)
+@app.post("/api/projects/{project_id}/scripts")
+def add_script(project_id: str, payload: ScriptCreate) -> dict[str, Any]:
+    get_project(project_id)
+    script_id = str(uuid.uuid4())
+    now = now_iso()
+    order_index = scalar("SELECT COUNT(*) FROM project_scripts WHERE project_id = ?", (project_id,)) + 1
     with connect() as conn:
         conn.execute(
-            "UPDATE projects SET status = ?, progress = ?, updated_at = ? WHERE id = ?",
-            ("analyzing", 25, now_iso(), project_id),
+            """
+            INSERT INTO project_scripts (
+                id, project_id, title, content, content_type, order_index, status,
+                word_count, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                script_id,
+                project_id,
+                payload.title or clean_title(payload.content),
+                payload.content,
+                payload.content_type,
+                order_index,
+                "draft",
+                len(payload.content),
+                now,
+                now,
+            ),
         )
-    create_project_graph(project_id, project["script"])
+        conn.execute(
+            "UPDATE projects SET active_script_id = ?, status = ?, progress = ?, updated_at = ? WHERE id = ?",
+            (script_id, "draft", 20, now, project_id),
+        )
     return project_detail(project_id)
+
+
+@app.get("/api/projects/{project_id}/scripts")
+def list_scripts(project_id: str) -> list[dict[str, Any]]:
+    get_project(project_id)
+    return get_scripts(project_id)
+
+
+@app.patch("/api/projects/{project_id}/scripts/{script_id}")
+def update_script(project_id: str, script_id: str, payload: ScriptUpdate) -> dict[str, Any]:
+    script = get_script(script_id)
+    if script["project_id"] != project_id:
+        raise HTTPException(status_code=400, detail="Script does not belong to project")
+    updates = payload.model_dump(exclude_unset=True)
+    if not updates:
+        return script
+    allowed = {"title", "content", "content_type"}
+    assignments = [f"{key} = ?" for key in updates if key in allowed]
+    values = [updates[key] for key in updates if key in allowed]
+    if "content" in updates and updates["content"] is not None:
+        assignments.append("word_count = ?")
+        values.append(len(updates["content"]))
+        assignments.append("status = ?")
+        values.append("draft")
+    assignments.append("updated_at = ?")
+    values.append(now_iso())
+    values.append(script_id)
+    with connect() as conn:
+        conn.execute(f"UPDATE project_scripts SET {', '.join(assignments)} WHERE id = ?", tuple(values))
+        conn.execute("UPDATE projects SET updated_at = ?, active_script_id = ? WHERE id = ?", (now_iso(), script_id, project_id))
+    return get_script(script_id)
+
+
+@app.patch("/api/projects/{project_id}/active-script")
+def set_active_script(project_id: str, payload: ActiveScriptUpdate) -> dict[str, Any]:
+    script = get_script(payload.script_id)
+    if script["project_id"] != project_id:
+        raise HTTPException(status_code=400, detail="Script does not belong to project")
+    with connect() as conn:
+        conn.execute("UPDATE projects SET active_script_id = ?, updated_at = ? WHERE id = ?", (payload.script_id, now_iso(), project_id))
+    return project_detail(project_id)
+
+
+@app.post("/api/projects/{project_id}/analyze")
+def analyze_active_project_script(project_id: str) -> dict[str, Any]:
+    project = get_project(project_id)
+    script = choose_script(project)
+    return analyze_script_into_project(project_id, script["id"])
+
+
+@app.post("/api/projects/{project_id}/scripts/{script_id}/analyze")
+def analyze_project_script(project_id: str, script_id: str) -> dict[str, Any]:
+    return analyze_script_into_project(project_id, script_id)
 
 
 @app.get("/api/projects/{project_id}/graph")
@@ -585,17 +930,7 @@ def entities(project_id: str) -> list[dict[str, Any]]:
 def update_entity(entity_id: str, payload: EntityUpdate) -> dict[str, Any]:
     entity = entity_with_images(entity_id)
     updates = payload.model_dump(exclude_unset=True)
-    if not updates:
-        return entity
-    allowed = {
-        "name",
-        "type",
-        "description",
-        "visual_description",
-        "prompt",
-        "status",
-        "main_image_id",
-    }
+    allowed = {"name", "type", "description", "visual_description", "prompt", "status", "main_image_id"}
     assignments = [f"{key} = ?" for key in updates if key in allowed]
     values = [updates[key] for key in updates if key in allowed]
     if not assignments:
@@ -608,6 +943,29 @@ def update_entity(entity_id: str, payload: EntityUpdate) -> dict[str, Any]:
     return entity_with_images(entity_id)
 
 
+@app.post("/api/entities/{entity_id}/merge")
+def merge_entity(entity_id: str, payload: EntityMerge) -> dict[str, Any]:
+    source = entity_with_images(entity_id)
+    target = entity_with_images(payload.target_entity_id)
+    if source["project_id"] != target["project_id"]:
+        raise HTTPException(status_code=400, detail="Entities belong to different projects")
+    source_scripts = source["source_script_ids"] + target["source_script_ids"]
+    now = now_iso()
+    with connect() as conn:
+        conn.execute(
+            """
+            UPDATE entities
+            SET source_script_ids = ?, occurrence_count = ?, updated_at = ?
+            WHERE id = ?
+            """,
+            (dump_ids(source_scripts), source["occurrence_count"] + target["occurrence_count"], now, target["id"]),
+        )
+        conn.execute("UPDATE entity_images SET entity_id = ? WHERE entity_id = ?", (target["id"], source["id"]))
+        conn.execute("UPDATE graph_nodes SET entity_id = ?, change_state = ? WHERE entity_id = ?", (target["id"], "updated", source["id"]))
+        conn.execute("DELETE FROM entities WHERE id = ?", (source["id"],))
+    return entity_with_images(target["id"])
+
+
 @app.post("/api/entities/{entity_id}/images")
 def generate_entity_image(entity_id: str, payload: EntityImageCreate) -> dict[str, Any]:
     entity = entity_with_images(entity_id)
@@ -617,9 +975,7 @@ def generate_entity_image(entity_id: str, payload: EntityImageCreate) -> dict[st
     image_url = storage_url(path)
     now = now_iso()
     with connect() as conn:
-        existing_count = conn.execute(
-            "SELECT COUNT(*) FROM entity_images WHERE entity_id = ?", (entity_id,)
-        ).fetchone()[0]
+        existing_count = conn.execute("SELECT COUNT(*) FROM entity_images WHERE entity_id = ?", (entity_id,)).fetchone()[0]
         is_main = 1 if existing_count == 0 else 0
         conn.execute(
             """
@@ -630,10 +986,7 @@ def generate_entity_image(entity_id: str, payload: EntityImageCreate) -> dict[st
             (image_id, entity_id, entity["project_id"], image_url, str(path), prompt, is_main, now),
         )
         if is_main:
-            conn.execute(
-                "UPDATE entities SET main_image_id = ?, status = ?, updated_at = ? WHERE id = ?",
-                (image_id, "image_ready", now, entity_id),
-            )
+            conn.execute("UPDATE entities SET main_image_id = ?, status = ?, updated_at = ? WHERE id = ?", (image_id, "image_ready", now, entity_id))
     return entity_with_images(entity_id)
 
 
@@ -653,36 +1006,36 @@ async def upload_reference_image(entity_id: str, file: UploadFile = File(...)) -
     prompt = entity.get("prompt") or default_prompt(entity)
     now = now_iso()
     with connect() as conn:
-        existing_count = conn.execute(
-            "SELECT COUNT(*) FROM entity_images WHERE entity_id = ?", (entity_id,)
-        ).fetchone()[0]
+        existing_count = conn.execute("SELECT COUNT(*) FROM entity_images WHERE entity_id = ?", (entity_id,)).fetchone()[0]
         is_main = 1 if existing_count == 0 else 0
         conn.execute(
             """
             INSERT INTO entity_images (
-                id, entity_id, project_id, image_url, file_path, prompt, reference_image_url, is_main, created_at
+                id, entity_id, project_id, image_url, file_path, prompt,
+                reference_image_url, is_main, created_at
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (image_id, entity_id, entity["project_id"], image_url, str(target), prompt, image_url, is_main, now),
         )
         if is_main:
-            conn.execute(
-                "UPDATE entities SET main_image_id = ?, status = ?, updated_at = ? WHERE id = ?",
-                (image_id, "image_ready", now, entity_id),
-            )
+            conn.execute("UPDATE entities SET main_image_id = ?, status = ?, updated_at = ? WHERE id = ?", (image_id, "image_ready", now, entity_id))
     return entity_with_images(entity_id)
 
 
 @app.post("/api/projects/{project_id}/frames/generate")
-def create_frames(project_id: str) -> list[dict[str, Any]]:
+def create_frames(project_id: str, payload: FrameGenerate) -> list[dict[str, Any]]:
     get_project(project_id)
-    return generate_frames(project_id)
+    return generate_frames(project_id, payload.scope, payload.script_id)
 
 
 @app.get("/api/projects/{project_id}/frames")
-def frames(project_id: str) -> list[dict[str, Any]]:
+def frames(
+    project_id: str,
+    scope: FrameScope | None = Query(default=None),
+    script_id: str | None = Query(default=None, alias="scriptId"),
+) -> list[dict[str, Any]]:
     get_project(project_id)
-    return get_frames(project_id)
+    return get_frames(project_id, scope, script_id)
 
 
 @app.patch("/api/frames/{frame_id}")
@@ -696,50 +1049,91 @@ def update_frame(frame_id: str, payload: FrameUpdate) -> dict[str, Any]:
         if "entity_ids" in updates and updates["entity_ids"] is not None:
             updates["entity_ids"] = json.dumps(updates["entity_ids"], ensure_ascii=False)
             updates["reference_image_ids"] = json.dumps([], ensure_ascii=False)
-        assignments = [f"{key} = ?" for key in updates if key in {"description", "camera", "mood", "entity_ids", "reference_image_ids"}]
-        values = [updates[key] for key in updates if key in {"description", "camera", "mood", "entity_ids", "reference_image_ids"}]
+        allowed = {"description", "camera", "mood", "entity_ids", "reference_image_ids"}
+        assignments = [f"{key} = ?" for key in updates if key in allowed]
+        values = [updates[key] for key in updates if key in allowed]
         assignments.append("updated_at = ?")
         values.append(now_iso())
         values.append(frame_id)
         conn.execute(f"UPDATE frames SET {', '.join(assignments)} WHERE id = ?", tuple(values))
-    return next(item for item in get_frames(frame["project_id"]) if item["id"] == frame_id)
+    return next(item for item in get_frames(frame["project_id"], frame["scope"], frame["script_id"]) if item["id"] == frame_id)
 
 
 @app.post("/api/projects/{project_id}/export")
-def export_project(project_id: str) -> dict[str, Any]:
+def export_project(project_id: str, payload: ExportCreate) -> dict[str, Any]:
     project = project_detail(project_id)
+    scripts = get_scripts_for_scope(project_id, payload.scope, payload.script_id)
+    script_id = scripts[0]["id"] if payload.scope == "current_script" else None
+    frames_to_export = get_frames(project_id, payload.scope, script_id)
+    if not frames_to_export:
+        frames_to_export = generate_frames(project_id, payload.scope, script_id)
     export_id = str(uuid.uuid4())
     target_dir = EXPORT_DIR / project_id
     target_dir.mkdir(parents=True, exist_ok=True)
     target = target_dir / f"{export_id}.zip"
-    manifest = {
-        "project": project,
-        "graph": project["graph"],
-        "entities": project["entities"],
-        "frames": project["frames"],
-    }
     with zipfile.ZipFile(target, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        manifest = {
+            "project": project,
+            "scope": payload.scope,
+            "scriptId": script_id,
+            "frameCount": len(frames_to_export),
+        }
         archive.writestr("manifest.json", json.dumps(manifest, ensure_ascii=False, indent=2))
-        archive.writestr("script.txt", project["script"])
-        frame_md = "\n\n".join([f"## Frame {frame['frame_index']}\n{frame['prompt']}" for frame in project["frames"]])
-        archive.writestr("frames.md", frame_md)
-        for entity in project["entities"]:
-            for image in entity["images"]:
-                file_path = Path(image["file_path"])
-                if file_path.exists():
-                    archive.write(file_path, f"images/{entity['name']}/{file_path.name}")
+        archive.writestr("project.json", json.dumps(project, ensure_ascii=False, indent=2))
+        archive.writestr("knowledge-graph/graph.json", json.dumps(project["graph"], ensure_ascii=False, indent=2))
+        archive.writestr("scripts/all-scripts.md", "\n\n".join([f"# {script['title']}\n\n{script['content']}" for script in project["scripts"]]))
+        if payload.scope == "current_script":
+            archive.writestr("scripts/current-script.md", f"# {scripts[0]['title']}\n\n{scripts[0]['content']}")
+        for frame in frames_to_export:
+            frame_dir = f"frames/{frame['frame_index']:03d}"
+            scene_md = "\n".join(
+                [
+                    f"# Frame {frame['frame_index']:03d}",
+                    "",
+                    f"- 所属剧本：{frame.get('script_title') or ''}",
+                    f"- 原文片段：{frame['source_text']}",
+                    f"- 镜头语言：{frame.get('camera') or ''}",
+                    f"- 情绪氛围：{frame.get('mood') or ''}",
+                    "",
+                    "## 场景描述",
+                    frame["description"],
+                    "",
+                    "## 完整提示词",
+                    frame["prompt"],
+                    "",
+                    "## 关联实体",
+                    "\n".join([f"- {entity['name']} ({entity['type']})" for entity in frame["entities"]]) or "- 无",
+                ]
+            )
+            archive.writestr(f"{frame_dir}/scene.md", scene_md)
+            frame_json = {key: value for key, value in frame.items() if key != "entities"}
+            frame_json["entityImageFiles"] = []
+            for entity in frame["entities"]:
+                main = next((image for image in entity["images"] if image["id"] == entity.get("main_image_id")), None)
+                if not main and entity["images"]:
+                    main = entity["images"][0]
+                if not main:
+                    continue
+                file_path = Path(main["file_path"])
+                if not file_path.exists():
+                    continue
+                suffix = file_path.suffix or ".png"
+                image_name = f"{safe_filename(entity['type'])}_{safe_filename(entity['name'])}{suffix}"
+                archive.write(file_path, f"{frame_dir}/entities/{image_name}")
+                frame_json["entityImageFiles"].append(image_name)
+            archive.writestr(f"{frame_dir}/frame.json", json.dumps(frame_json, ensure_ascii=False, indent=2))
     file_url = storage_url(target)
     now = now_iso()
     with connect() as conn:
         conn.execute(
-            "INSERT INTO exports (id, project_id, file_url, file_path, created_at) VALUES (?, ?, ?, ?, ?)",
-            (export_id, project_id, file_url, str(target), now),
+            """
+            INSERT INTO exports (id, project_id, script_id, scope, file_url, file_path, frame_count, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (export_id, project_id, script_id, payload.scope, file_url, str(target), len(frames_to_export), now),
         )
-        conn.execute(
-            "UPDATE projects SET status = ?, progress = ?, updated_at = ? WHERE id = ?",
-            ("export_ready", 100, now, project_id),
-        )
-    return {"id": export_id, "file_url": file_url, "created_at": now}
+        conn.execute("UPDATE projects SET status = ?, progress = ?, updated_at = ? WHERE id = ?", ("export_ready", 100, now, project_id))
+    return {"id": export_id, "file_url": file_url, "scope": payload.scope, "frame_count": len(frames_to_export), "created_at": now}
 
 
 ensure_directories()

@@ -1,15 +1,15 @@
 <script setup lang="ts">
-import { computed, onMounted, ref } from 'vue';
+import { computed, onMounted, ref, watch } from 'vue';
 import { api } from './api';
-import type { Entity, KnowledgeGraphNode, Project, VideoFrame } from './types';
+import type { Entity, FrameScope, KnowledgeGraphNode, Project, ProjectScript, VideoFrame } from './types';
 
 const steps = [
-  { key: 'script', title: '输入剧本', description: '粘贴文字剧本并创建项目' },
-  { key: 'graph', title: '解析图谱', description: '查看知识图谱和对象关系' },
-  { key: 'entities', title: '确认实体', description: '修正人物、物品、场景' },
+  { key: 'script', title: '剧本管理', description: '项目下新增和切换剧本' },
+  { key: 'graph', title: '解析图谱', description: '增量更新项目级知识图谱' },
+  { key: 'entities', title: '确认实体', description: '维护项目级实体资产' },
   { key: 'images', title: '生成模型图', description: '生成或上传实体参考图' },
-  { key: 'frames', title: '生成分帧', description: '获得帧级画面提示词' },
-  { key: 'export', title: '导出素材', description: '下载结构化素材包' },
+  { key: 'frames', title: '生成分帧', description: '当前剧本或总剧本分帧' },
+  { key: 'export', title: '导出素材', description: '按帧目录导出素材包' },
 ] as const;
 
 type StepKey = (typeof steps)[number]['key'];
@@ -17,30 +17,44 @@ type StepKey = (typeof steps)[number]['key'];
 const activeStep = ref<StepKey>('script');
 const projects = ref<Project[]>([]);
 const currentProject = ref<Project | null>(null);
-const selectedEntityId = ref<string>('');
+const selectedEntityId = ref('');
 const selectedNode = ref<KnowledgeGraphNode | null>(null);
+const selectedEntityPrompt = ref('');
+const frameScope = ref<FrameScope>('current_script');
+const exportScope = ref<FrameScope>('current_script');
 const loading = ref(false);
 const message = ref('');
 const error = ref('');
 
 const form = ref({
   title: '',
+  script_title: '',
   content_type: '故事短片',
   script:
     '小明在雨后的城市街道上发现一把发光的钥匙。钥匙指引他来到一间旧书店，店里的老人告诉他，这把钥匙可以打开隐藏在学校天台上的星空之门。小明背着背包穿过空荡的走廊，在天台上举起钥匙，城市的灯光逐渐变成璀璨星河。',
 });
 
-const selectedEntity = computed(() => {
-  const entities = currentProject.value?.entities ?? [];
-  return entities.find((entity) => entity.id === selectedEntityId.value) ?? entities[0] ?? null;
-});
-
-const canUseProject = computed(() => Boolean(currentProject.value));
+const activeScript = computed(() => currentProject.value?.active_script ?? null);
+const scripts = computed(() => currentProject.value?.scripts ?? []);
 const graph = computed(() => currentProject.value?.graph ?? { nodes: [], edges: [] });
 const entities = computed(() => currentProject.value?.entities ?? []);
-const frames = computed(() => currentProject.value?.frames ?? []);
+const allFrames = computed(() => currentProject.value?.frames ?? []);
+const currentFrames = computed(() =>
+  allFrames.value.filter((frame) => {
+    if (frame.scope !== frameScope.value) return false;
+    if (frameScope.value === 'current_script') return frame.script_id === activeScript.value?.id;
+    return true;
+  }),
+);
 const exportsList = computed(() => currentProject.value?.exports ?? []);
-const selectedEntityPrompt = ref('');
+const selectedEntity = computed(() => {
+  return entities.value.find((entity) => entity.id === selectedEntityId.value) ?? entities.value[0] ?? null;
+});
+const canUseProject = computed(() => Boolean(currentProject.value));
+
+watch(selectedEntity, (entity) => {
+  selectedEntityPrompt.value = entity?.prompt ?? '';
+});
 
 function assetUrl(path?: string) {
   if (!path) return '';
@@ -84,6 +98,7 @@ async function loadProject(projectId: string, step?: StepKey) {
   currentProject.value = data;
   selectedEntityId.value = data.entities?.[0]?.id ?? '';
   selectedEntityPrompt.value = data.entities?.[0]?.prompt ?? '';
+  selectedNode.value = data.graph?.nodes[0] ?? null;
   if (step) activeStep.value = step;
 }
 
@@ -96,10 +111,11 @@ async function createProject() {
     () =>
       api.createProject({
         title: form.value.title || undefined,
+        script_title: form.value.script_title || undefined,
         script: form.value.script,
         content_type: form.value.content_type,
       }),
-    '项目已创建',
+    '项目已创建，首个剧本已加入项目',
   );
   if (!project) return;
   currentProject.value = project;
@@ -107,13 +123,44 @@ async function createProject() {
   activeStep.value = 'graph';
 }
 
-async function analyzeProject() {
+async function addScript() {
   if (!currentProject.value) return;
-  const project = await run(() => api.analyzeProject(currentProject.value!.id), '知识图谱和实体已生成');
+  if (form.value.script.trim().length < 20) {
+    setError(new Error('新增剧本至少需要 20 个字'));
+    return;
+  }
+  const project = await run(
+    () =>
+      api.addScript(currentProject.value!.id, {
+        title: form.value.script_title || undefined,
+        content: form.value.script,
+        content_type: form.value.content_type,
+      }),
+    '新剧本已加入当前项目',
+  );
+  if (!project) return;
+  currentProject.value = project;
+  await refreshProjects();
+}
+
+async function setActiveScript(script: ProjectScript) {
+  if (!currentProject.value) return;
+  const project = await run(() => api.setActiveScript(currentProject.value!.id, script.id), '已切换当前剧本');
+  if (!project) return;
+  currentProject.value = project;
+  form.value.script_title = script.title;
+  form.value.script = script.content;
+}
+
+async function analyzeActiveScript() {
+  if (!currentProject.value || !activeScript.value) return;
+  const project = await run(
+    () => api.analyzeScript(currentProject.value!.id, activeScript.value!.id),
+    '当前剧本已解析，项目级图谱和实体已增量更新',
+  );
   if (!project) return;
   currentProject.value = project;
   selectedEntityId.value = project.entities?.[0]?.id ?? '';
-  selectedEntityPrompt.value = project.entities?.[0]?.prompt ?? '';
   activeStep.value = 'graph';
   await refreshProjects();
 }
@@ -158,7 +205,14 @@ async function setMainImage(entity: Entity, imageId: string) {
 
 async function generateFrames() {
   if (!currentProject.value) return;
-  const data = await run(() => api.generateFrames(currentProject.value!.id), '分帧描述已生成');
+  if (frameScope.value === 'current_script' && !activeScript.value) {
+    setError(new Error('请先选择当前剧本'));
+    return;
+  }
+  const data = await run(
+    () => api.generateFrames(currentProject.value!.id, frameScope.value, activeScript.value?.id),
+    frameScope.value === 'current_script' ? '当前剧本分帧已生成' : '总剧本分帧已生成',
+  );
   if (!data || !currentProject.value) return;
   await loadProject(currentProject.value.id, 'frames');
 }
@@ -180,7 +234,14 @@ async function saveFrame(frame: VideoFrame) {
 
 async function exportProject() {
   if (!currentProject.value) return;
-  await run(() => api.exportProject(currentProject.value!.id), '素材包已导出');
+  if (exportScope.value === 'current_script' && !activeScript.value) {
+    setError(new Error('请先选择当前剧本'));
+    return;
+  }
+  await run(
+    () => api.exportProject(currentProject.value!.id, exportScope.value, activeScript.value?.id),
+    exportScope.value === 'current_script' ? '当前剧本素材包已导出' : '总剧本素材包已导出',
+  );
   await loadProject(currentProject.value.id, 'export');
   await refreshProjects();
 }
@@ -205,7 +266,7 @@ onMounted(async () => {
         <span class="brand-mark">W2V</span>
         <div>
           <strong>Word2Video</strong>
-          <small>AI 视频素材工作台</small>
+          <small>项目级 AI 视频素材工作台</small>
         </div>
       </div>
 
@@ -236,7 +297,7 @@ onMounted(async () => {
           @click="loadProject(project.id)"
         >
           <strong>{{ project.title }}</strong>
-          <small>{{ project.status }} · {{ project.entity_count }} 个实体 · {{ project.frame_count }} 帧</small>
+          <small>{{ project.status }} · {{ project.script_count }} 剧本 · {{ project.entity_count }} 实体</small>
         </button>
         <p v-if="projects.length === 0" class="muted">暂无项目，先创建一个剧本项目。</p>
       </section>
@@ -261,14 +322,31 @@ onMounted(async () => {
         <div class="panel-title">
           <div>
             <p class="eyebrow">Step 1</p>
-            <h2>输入文字剧本</h2>
+            <h2>项目剧本管理</h2>
           </div>
-          <button class="primary" :disabled="loading" @click="createProject">创建项目</button>
+          <div class="toolbar">
+            <button class="secondary" :disabled="!currentProject || loading" @click="addScript">加入当前项目</button>
+            <button class="primary" :disabled="loading" @click="createProject">创建新项目</button>
+          </div>
         </div>
+
+        <div v-if="scripts.length" class="script-list">
+          <button
+            v-for="script in scripts"
+            :key="script.id"
+            class="script-item"
+            :class="{ active: script.id === activeScript?.id }"
+            @click="setActiveScript(script)"
+          >
+            <strong>{{ script.order_index }}. {{ script.title }}</strong>
+            <small>{{ script.status }} · {{ script.word_count }} 字</small>
+          </button>
+        </div>
+
         <div class="form-grid">
           <label>
             项目标题
-            <input v-model="form.title" placeholder="默认使用剧本前 24 个字" />
+            <input v-model="form.title" placeholder="创建新项目时使用" />
           </label>
           <label>
             内容类型
@@ -281,12 +359,18 @@ onMounted(async () => {
           </label>
         </div>
         <label>
+          剧本标题
+          <input v-model="form.script_title" placeholder="默认使用剧本前 24 个字" />
+        </label>
+        <label>
           剧本文字
-          <textarea v-model="form.script" rows="18" />
+          <textarea v-model="form.script" rows="14" />
         </label>
         <footer class="panel-footer">
-          <span>{{ form.script.length }} 字</span>
-          <button class="secondary" :disabled="!currentProject || loading" @click="analyzeProject">解析当前项目</button>
+          <span>{{ form.script.length }} 字 · 当前剧本：{{ activeScript?.title ?? '未选择' }}</span>
+          <button class="secondary" :disabled="!activeScript || loading" @click="analyzeActiveScript">
+            解析当前剧本并更新项目资产
+          </button>
         </footer>
       </section>
 
@@ -294,9 +378,9 @@ onMounted(async () => {
         <div class="panel-title">
           <div>
             <p class="eyebrow">Step 2</p>
-            <h2>知识图谱</h2>
+            <h2>项目级知识图谱</h2>
           </div>
-          <button class="primary" :disabled="!currentProject || loading" @click="analyzeProject">重新解析</button>
+          <button class="primary" :disabled="!activeScript || loading" @click="analyzeActiveScript">解析当前剧本</button>
         </div>
         <div v-if="graph.nodes.length" class="graph-layout">
           <svg class="graph-canvas" viewBox="0 0 920 560" role="img">
@@ -314,6 +398,7 @@ onMounted(async () => {
               v-for="node in graph.nodes"
               :key="node.id"
               class="graph-node"
+              :class="{ changed: node.change_state !== 'existing' }"
               :transform="`translate(${node.x}, ${node.y})`"
               @click="selectedNode = node"
             >
@@ -325,10 +410,11 @@ onMounted(async () => {
             <h3>{{ selectedNode?.name ?? graph.nodes[0].name }}</h3>
             <p>{{ selectedNode?.description ?? graph.nodes[0].description }}</p>
             <small>类型：{{ selectedNode?.type ?? graph.nodes[0].type }}</small>
+            <small>来源剧本数：{{ (selectedNode?.source_script_ids ?? graph.nodes[0].source_script_ids).length }}</small>
           </aside>
         </div>
         <div v-else class="empty">
-          <p>还没有知识图谱。请先创建项目并点击解析。</p>
+          <p>还没有知识图谱。请先创建项目并解析当前剧本。</p>
         </div>
       </section>
 
@@ -336,7 +422,7 @@ onMounted(async () => {
         <div class="panel-title">
           <div>
             <p class="eyebrow">Step 3</p>
-            <h2>确认实体对象</h2>
+            <h2>项目级实体对象</h2>
           </div>
           <button class="secondary" @click="activeStep = 'images'">进入图片生成</button>
         </div>
@@ -353,7 +439,7 @@ onMounted(async () => {
             </div>
             <textarea v-model="entity.description" rows="4" />
             <div class="card-actions">
-              <span class="pill">{{ entity.status }}</span>
+              <span class="pill">{{ entity.status }} · {{ entity.source_script_count }} 剧本</span>
               <button class="secondary" @click="saveEntity(entity)">保存</button>
             </div>
           </article>
@@ -364,7 +450,7 @@ onMounted(async () => {
         <div class="panel-title">
           <div>
             <p class="eyebrow">Step 4</p>
-            <h2>实体模型参考图</h2>
+            <h2>项目级实体模型参考图</h2>
           </div>
           <button class="secondary" @click="activeStep = 'frames'">进入分帧</button>
         </div>
@@ -378,7 +464,7 @@ onMounted(async () => {
               @click="chooseEntity(entity)"
             >
               <strong>{{ entity.name }}</strong>
-              <small>{{ entity.type }} · {{ entity.images.length }} 张图</small>
+              <small>{{ entity.type }} · {{ entity.images.length }} 张图 · {{ entity.source_script_count }} 剧本</small>
             </button>
           </div>
           <div v-if="selectedEntity" class="image-workbench">
@@ -415,9 +501,14 @@ onMounted(async () => {
           </div>
           <button class="primary" :disabled="!currentProject || loading" @click="generateFrames">生成分帧</button>
         </div>
+        <div class="scope-bar">
+          <label><input v-model="frameScope" type="radio" value="current_script" /> 当前剧本</label>
+          <label><input v-model="frameScope" type="radio" value="all_scripts" /> 总剧本</label>
+          <span>{{ frameScope === 'current_script' ? activeScript?.title ?? '未选择当前剧本' : `${scripts.length} 个剧本` }}</span>
+        </div>
         <div class="frame-list">
-          <article v-for="frame in frames" :key="frame.id" class="frame-card">
-            <div class="frame-index">Frame {{ frame.frame_index }}</div>
+          <article v-for="frame in currentFrames" :key="frame.id" class="frame-card">
+            <div class="frame-index">Frame {{ frame.frame_index }} · {{ frame.script_title }} · {{ frame.scope }}</div>
             <textarea v-model="frame.description" rows="4" />
             <div class="form-grid">
               <input v-model="frame.camera" placeholder="镜头语言" />
@@ -443,14 +534,19 @@ onMounted(async () => {
           </div>
           <button class="primary" :disabled="!currentProject || loading" @click="exportProject">导出 ZIP</button>
         </div>
+        <div class="scope-bar">
+          <label><input v-model="exportScope" type="radio" value="current_script" /> 当前剧本</label>
+          <label><input v-model="exportScope" type="radio" value="all_scripts" /> 总剧本</label>
+          <span>导出结构：frames/001/scene.md + entities/实体图</span>
+        </div>
         <div class="export-summary">
-          <div><strong>{{ entities.length }}</strong><span>实体对象</span></div>
-          <div><strong>{{ frames.length }}</strong><span>分帧描述</span></div>
-          <div><strong>{{ exportsList.length }}</strong><span>导出记录</span></div>
+          <div><strong>{{ scripts.length }}</strong><span>项目剧本</span></div>
+          <div><strong>{{ entities.length }}</strong><span>共享实体</span></div>
+          <div><strong>{{ currentFrames.length }}</strong><span>当前范围帧</span></div>
         </div>
         <div class="export-list">
           <a v-for="item in exportsList" :key="item.id" :href="assetUrl(item.file_url)" download>
-            下载素材包 · {{ new Date(item.created_at).toLocaleString() }}
+            下载 {{ item.scope }} 素材包 · {{ item.frame_count }} 帧 · {{ new Date(item.created_at).toLocaleString() }}
           </a>
         </div>
       </section>
@@ -462,6 +558,8 @@ onMounted(async () => {
         <p v-if="!currentProject">还没有选中的项目。</p>
         <template v-else>
           <div class="metric"><span>状态</span><strong>{{ currentProject.status }}</strong></div>
+          <div class="metric"><span>当前剧本</span><strong>{{ activeScript?.title ?? '未选择' }}</strong></div>
+          <div class="metric"><span>总剧本</span><strong>{{ currentProject.script_count }}</strong></div>
           <div class="metric"><span>实体</span><strong>{{ currentProject.entity_count }}</strong></div>
           <div class="metric"><span>已配图实体</span><strong>{{ currentProject.completed_entity_image_count }}</strong></div>
           <div class="metric"><span>分帧</span><strong>{{ currentProject.frame_count }}</strong></div>
@@ -470,12 +568,12 @@ onMounted(async () => {
 
       <section class="summary-card">
         <h2>下一步</h2>
-        <p v-if="activeStep === 'script'">创建项目后进入知识图谱解析。</p>
-        <p v-else-if="activeStep === 'graph'">确认图谱中的实体和关系是否合理。</p>
-        <p v-else-if="activeStep === 'entities'">修正实体名称、类型和描述。</p>
-        <p v-else-if="activeStep === 'images'">为每个实体生成或上传主参考图。</p>
-        <p v-else-if="activeStep === 'frames'">生成分帧后可复制单帧提示词。</p>
-        <p v-else>导出 ZIP 后即可带到其他 AI 平台继续生成画面。</p>
+        <p v-if="activeStep === 'script'">在项目中新增剧本，或切换当前剧本继续解析。</p>
+        <p v-else-if="activeStep === 'graph'">检查当前剧本给项目图谱带来的新增节点和关系。</p>
+        <p v-else-if="activeStep === 'entities'">维护项目级实体，实体图会被所有剧本共用。</p>
+        <p v-else-if="activeStep === 'images'">为项目实体生成或上传主参考图。</p>
+        <p v-else-if="activeStep === 'frames'">选择当前剧本或总剧本生成分帧。</p>
+        <p v-else>选择导出范围，素材包会按数字帧目录组织。</p>
       </section>
     </aside>
   </div>
