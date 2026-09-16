@@ -460,8 +460,6 @@ def guess_entities(script: str) -> list[dict[str, str]]:
             {"name": "关键物品", "type": "object", "description": "推动剧情发展的重要道具。"},
             {"name": "主要场景", "type": "scene", "description": "故事发生的主要环境。"},
         ]
-    if not any(item["type"] == "concept" for item in found):
-        found.append({"name": "核心情绪", "type": "concept", "description": "贯穿剧本的画面氛围和情绪主题。"})
     return found[:18]
 
 
@@ -710,6 +708,23 @@ def upsert_parsed_entity(conn: sqlite3.Connection, project_id: str, parsed: Pars
     return entity_id
 
 
+def remove_stale_entities(conn: sqlite3.Connection, project_id: str, keep_names: set[str]) -> None:
+    stale_entities = conn.execute(
+        "SELECT id FROM entities WHERE project_id = ? AND name NOT IN ({})".format(
+            ",".join(["?"] * len(keep_names)) if keep_names else "''"
+        ),
+        tuple([project_id, *keep_names]) if keep_names else (project_id,),
+    ).fetchall()
+    for entity in stale_entities:
+        images = conn.execute("SELECT file_path FROM entity_images WHERE entity_id = ?", (entity["id"],)).fetchall()
+        for image in images:
+            file_path = Path(image["file_path"])
+            if file_path.exists() and file_path.resolve().is_relative_to(DATA_DIR):
+                file_path.unlink()
+        conn.execute("DELETE FROM entity_images WHERE entity_id = ?", (entity["id"],))
+        conn.execute("DELETE FROM entities WHERE id = ?", (entity["id"],))
+
+
 def insert_parsed_entity_node(
     conn: sqlite3.Connection,
     project_id: str,
@@ -815,6 +830,7 @@ def analyze_project_graph(project_id: str) -> dict[str, Any]:
     with connect() as conn:
         conn.execute("DELETE FROM graph_edges WHERE project_id = ?", (project_id,))
         conn.execute("DELETE FROM graph_nodes WHERE project_id = ?", (project_id,))
+        remove_stale_entities(conn, project_id, {entity.name for entity in parsed.entities})
         for script in scripts:
             conn.execute("UPDATE project_scripts SET status = ?, updated_at = ? WHERE id = ?", ("analyzing", now, script["id"]))
 
@@ -1032,7 +1048,7 @@ def generate_frames(project_id: str, script_ids: list[str]) -> list[dict[str, An
                         image = conn.execute("SELECT image_url FROM entity_images WHERE id = ?", (entity["main_image_id"],)).fetchone()
                         if image:
                             image_urls.append(image["image_url"])
-                description = f"第 {frame_index} 帧：{source}。画面需要突出 {', '.join(names) if names else '核心情绪'}。"
+                description = f"第 {frame_index} 帧：{source}。画面需要突出 {', '.join(names) if names else '当前剧情'}。"
                 prompt = build_frame_prompt(description, names, image_urls)
                 conn.execute(
                     """

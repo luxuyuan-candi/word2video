@@ -456,7 +456,6 @@ onMounted(async () => {
                 <option value="concept">概念</option>
               </select>
             </div>
-            <textarea v-model="entity.description" rows="4" />
             <div class="card-actions">
               <span class="pill">{{ entity.status }} · {{ entity.source_script_count }} 幕</span>
               <button class="secondary" @click="saveEntity(entity)">保存</button>

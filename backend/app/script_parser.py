@@ -315,7 +315,5 @@ def parse_project_scripts(scripts: list[dict[str, str]]) -> ParsedGraph:
     if not entities:
         entities[entity_key("主角")] = ParsedEntity("主角", "character", entity_description("character", "主角"))
         entities[entity_key("主要场景")] = ParsedEntity("主要场景", "scene", entity_description("scene", "主要场景"))
-    if not any(entity.type == "concept" for entity in entities.values()):
-        entities[entity_key("核心情绪")] = ParsedEntity("核心情绪", "concept", entity_description("concept", "核心情绪"))
 
     return ParsedGraph(entities=list(entities.values()), events=events, relations=relations)
