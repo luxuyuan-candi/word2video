@@ -18,7 +18,8 @@ textarea {
   font: inherit;
 }
 
-input[type="radio"] {
+input[type="radio"],
+input[type="checkbox"] {
   width: auto;
   accent-color: #2563eb;
 }
@@ -140,6 +141,47 @@ button:disabled {
 .history-item {
   margin-bottom: 8px;
   padding: 10px;
+}
+
+.project-create {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 8px;
+  margin-bottom: 10px;
+}
+
+.project-row {
+  border: 1px solid transparent;
+  border-radius: 8px;
+  padding: 8px;
+}
+
+.project-row.active {
+  border-color: #2563eb;
+  background: #eff6ff;
+}
+
+.project-row .history-item {
+  margin-bottom: 8px;
+  padding: 4px 0;
+}
+
+.project-actions {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 32px;
+  gap: 8px;
+}
+
+.icon-button {
+  width: 32px;
+  height: 32px;
+  border: 1px solid #fecaca;
+  border-radius: 8px;
+  background: #fff1f2;
+  color: #be123c;
+  font-size: 20px;
+  font-weight: 800;
+  line-height: 1;
 }
 
 .script-list {
@@ -550,4 +592,9 @@ pre {
   border: 1px dashed #cbd5e1;
   border-radius: 8px;
   color: #64748b;
+}
+
+.empty.compact {
+  min-height: 120px;
+  margin-bottom: 16px;
 }

@@ -23,7 +23,7 @@ BACKEND_DIR = Path(__file__).resolve().parents[1]
 REPO_DIR = Path(__file__).resolve().parents[2]
 load_dotenv(BACKEND_DIR / ".env")
 
-FrameScope = Literal["current_script", "all_scripts"]
+FrameScope = Literal["selected_scripts"]
 
 
 class Settings(BaseSettings):
@@ -272,13 +272,17 @@ def backfill_scripts(conn: sqlite3.Connection) -> None:
 class ProjectCreate(BaseModel):
     title: str | None = None
     script_title: str | None = None
-    script: str = Field(min_length=20)
+    script: str | None = None
     content_type: str | None = None
+
+
+class ProjectUpdate(BaseModel):
+    title: str
 
 
 class ScriptCreate(BaseModel):
     title: str | None = None
-    content: str = Field(min_length=20)
+    content: str = ""
     content_type: str | None = None
 
 
@@ -311,8 +315,8 @@ class EntityImageCreate(BaseModel):
 
 
 class FrameGenerate(BaseModel):
-    scope: FrameScope = "current_script"
-    script_id: str | None = None
+    scope: FrameScope = "selected_scripts"
+    script_ids: list[str] = Field(default_factory=list)
 
 
 class FrameUpdate(BaseModel):
@@ -323,8 +327,8 @@ class FrameUpdate(BaseModel):
 
 
 class ExportCreate(BaseModel):
-    scope: FrameScope = "current_script"
-    script_id: str | None = None
+    scope: FrameScope = "selected_scripts"
+    script_ids: list[str] = Field(default_factory=list)
 
 
 def row_to_dict(row: sqlite3.Row | None) -> dict[str, Any] | None:
@@ -416,11 +420,14 @@ def choose_script(project: dict[str, Any], script_id: str | None = None) -> dict
     return script
 
 
-def get_scripts_for_scope(project_id: str, scope: FrameScope, script_id: str | None = None) -> list[dict[str, Any]]:
-    project = get_project(project_id)
-    if scope == "current_script":
-        return [choose_script(project, script_id)]
-    return get_scripts(project_id)
+def get_scripts_by_ids(project_id: str, script_ids: list[str]) -> list[dict[str, Any]]:
+    scripts = get_scripts(project_id)
+    if not script_ids:
+        return scripts
+    selected = [script for script in scripts if script["id"] in set(script_ids)]
+    if len(selected) != len(set(script_ids)):
+        raise HTTPException(status_code=400, detail="Some scripts do not belong to project")
+    return selected
 
 
 def guess_entities(script: str) -> list[dict[str, str]]:
@@ -589,7 +596,7 @@ def analyze_script_into_project(project_id: str, script_id: str) -> dict[str, An
                     node_ids[index],
                     node_ids[index + 1],
                     "关联",
-                    "当前剧本中存在连续叙事关联。",
+                    "所选剧幕中存在连续叙事关联。",
                     script["content"][:180],
                     dump_ids([script_id]),
                 ),
@@ -672,15 +679,20 @@ def build_frame_prompt(description: str, entity_names: list[str], refs: list[str
     return f"{description}\nReferenced entities: {names}\nReference images: {references}"
 
 
-def generate_frames(project_id: str, scope: FrameScope, script_id: str | None = None) -> list[dict[str, Any]]:
-    scripts = get_scripts_for_scope(project_id, scope, script_id)
+def generate_frames(project_id: str, script_ids: list[str]) -> list[dict[str, Any]]:
+    scripts = get_scripts_by_ids(project_id, script_ids)
+    if not scripts:
+        raise HTTPException(status_code=400, detail="Please select at least one script")
     entities = get_entities(project_id)
     now = now_iso()
+    selected_ids = [script["id"] for script in scripts]
+    selection_key = dump_ids(selected_ids)
     with connect() as conn:
-        if scope == "current_script":
-            conn.execute("DELETE FROM frames WHERE project_id = ? AND scope = ? AND script_id = ?", (project_id, scope, scripts[0]["id"]))
-        else:
-            conn.execute("DELETE FROM frames WHERE project_id = ? AND scope = ?", (project_id, scope))
+        placeholders = ",".join(["?"] * len(selected_ids))
+        conn.execute(
+            f"DELETE FROM frames WHERE project_id = ? AND scope = ? AND script_id IN ({placeholders})",
+            tuple([project_id, selection_key, *selected_ids]),
+        )
         frame_index = 1
         for script in scripts:
             chunks = split_script(script["content"])
@@ -712,7 +724,7 @@ def generate_frames(project_id: str, scope: FrameScope, script_id: str | None = 
                         project_id,
                         script["id"],
                         script["title"],
-                        scope,
+                        selection_key,
                         frame_index,
                         source,
                         description,
@@ -727,18 +739,19 @@ def generate_frames(project_id: str, scope: FrameScope, script_id: str | None = 
                 )
                 frame_index += 1
         conn.execute("UPDATE projects SET status = ?, progress = ?, updated_at = ? WHERE id = ?", ("frames_ready", 85, now, project_id))
-    return get_frames(project_id, scope, scripts[0]["id"] if scope == "current_script" else None)
+    return get_frames(project_id, selection_key, selected_ids)
 
 
-def get_frames(project_id: str, scope: FrameScope | None = None, script_id: str | None = None) -> list[dict[str, Any]]:
+def get_frames(project_id: str, scope: str | None = None, script_ids: list[str] | None = None) -> list[dict[str, Any]]:
     query = "SELECT * FROM frames WHERE project_id = ?"
     params: list[Any] = [project_id]
     if scope:
         query += " AND scope = ?"
         params.append(scope)
-    if script_id:
-        query += " AND script_id = ?"
-        params.append(script_id)
+    if script_ids:
+        placeholders = ",".join(["?"] * len(script_ids))
+        query += f" AND script_id IN ({placeholders})"
+        params.extend(script_ids)
     query += " ORDER BY scope, frame_index"
     frames = list_rows(query, tuple(params))
     entities = {entity["id"]: entity for entity in get_entities(project_id)}
@@ -782,9 +795,10 @@ def health() -> dict[str, str]:
 @app.post("/api/projects")
 def create_project(payload: ProjectCreate) -> dict[str, Any]:
     project_id = str(uuid.uuid4())
-    script_id = str(uuid.uuid4())
-    title = payload.title or clean_title(payload.script)
-    script_title = payload.script_title or clean_title(payload.script)
+    script_id = str(uuid.uuid4()) if payload.script else None
+    script_content = payload.script or ""
+    title = payload.title or clean_title(script_content) if script_content else payload.title or "未命名项目"
+    script_title = payload.script_title or clean_title(script_content) if script_content else payload.script_title or "第一幕"
     now = now_iso()
     with connect() as conn:
         conn.execute(
@@ -794,18 +808,41 @@ def create_project(payload: ProjectCreate) -> dict[str, Any]:
                 progress, created_at, updated_at
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            (project_id, title, payload.script, payload.content_type, script_id, "draft", 10, now, now),
+            (project_id, title, script_content, payload.content_type, script_id, "draft", 10, now, now),
         )
-        conn.execute(
-            """
-            INSERT INTO project_scripts (
-                id, project_id, title, content, content_type, order_index, status,
-                word_count, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (script_id, project_id, script_title, payload.script, payload.content_type, 1, "draft", len(payload.script), now, now),
-        )
+        if script_id:
+            conn.execute(
+                """
+                INSERT INTO project_scripts (
+                    id, project_id, title, content, content_type, order_index, status,
+                    word_count, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (script_id, project_id, script_title, script_content, payload.content_type, 1, "draft", len(script_content), now, now),
+            )
     return project_detail(project_id)
+
+
+@app.patch("/api/projects/{project_id}")
+def update_project(project_id: str, payload: ProjectUpdate) -> dict[str, Any]:
+    get_project(project_id)
+    with connect() as conn:
+        conn.execute("UPDATE projects SET title = ?, updated_at = ? WHERE id = ?", (payload.title, now_iso(), project_id))
+    return project_detail(project_id)
+
+
+@app.delete("/api/projects/{project_id}")
+def delete_project(project_id: str) -> dict[str, str]:
+    get_project(project_id)
+    with connect() as conn:
+        for table in ["exports", "frames", "entity_images", "entities", "graph_edges", "graph_nodes", "project_scripts"]:
+            conn.execute(f"DELETE FROM {table} WHERE project_id = ?", (project_id,))
+        conn.execute("DELETE FROM projects WHERE id = ?", (project_id,))
+    project_paths = [UPLOAD_DIR / project_id, GENERATED_DIR / project_id, EXPORT_DIR / project_id]
+    for path in project_paths:
+        if path.exists() and path.resolve().is_relative_to(DATA_DIR):
+            shutil.rmtree(path)
+    return {"status": "deleted"}
 
 
 @app.get("/api/projects")
@@ -892,6 +929,25 @@ def update_script(project_id: str, script_id: str, payload: ScriptUpdate) -> dic
     return get_script(script_id)
 
 
+@app.delete("/api/projects/{project_id}/scripts/{script_id}")
+def delete_script(project_id: str, script_id: str) -> dict[str, Any]:
+    script = get_script(script_id)
+    if script["project_id"] != project_id:
+        raise HTTPException(status_code=400, detail="Script does not belong to project")
+    with connect() as conn:
+        conn.execute("DELETE FROM project_scripts WHERE id = ?", (script_id,))
+        conn.execute("DELETE FROM frames WHERE project_id = ? AND script_id = ?", (project_id, script_id))
+        next_script = conn.execute(
+            "SELECT id FROM project_scripts WHERE project_id = ? ORDER BY order_index, created_at LIMIT 1",
+            (project_id,),
+        ).fetchone()
+        conn.execute(
+            "UPDATE projects SET active_script_id = ?, updated_at = ? WHERE id = ?",
+            (next_script["id"] if next_script else None, now_iso(), project_id),
+        )
+    return project_detail(project_id)
+
+
 @app.patch("/api/projects/{project_id}/active-script")
 def set_active_script(project_id: str, payload: ActiveScriptUpdate) -> dict[str, Any]:
     script = get_script(payload.script_id)
@@ -904,9 +960,13 @@ def set_active_script(project_id: str, payload: ActiveScriptUpdate) -> dict[str,
 
 @app.post("/api/projects/{project_id}/analyze")
 def analyze_active_project_script(project_id: str) -> dict[str, Any]:
-    project = get_project(project_id)
-    script = choose_script(project)
-    return analyze_script_into_project(project_id, script["id"])
+    scripts = get_scripts(project_id)
+    if not scripts:
+        raise HTTPException(status_code=400, detail="Project has no script")
+    detail: dict[str, Any] | None = None
+    for script in scripts:
+        detail = analyze_script_into_project(project_id, script["id"])
+    return detail or project_detail(project_id)
 
 
 @app.post("/api/projects/{project_id}/scripts/{script_id}/analyze")
@@ -1025,17 +1085,17 @@ async def upload_reference_image(entity_id: str, file: UploadFile = File(...)) -
 @app.post("/api/projects/{project_id}/frames/generate")
 def create_frames(project_id: str, payload: FrameGenerate) -> list[dict[str, Any]]:
     get_project(project_id)
-    return generate_frames(project_id, payload.scope, payload.script_id)
+    return generate_frames(project_id, payload.script_ids)
 
 
 @app.get("/api/projects/{project_id}/frames")
 def frames(
     project_id: str,
-    scope: FrameScope | None = Query(default=None),
-    script_id: str | None = Query(default=None, alias="scriptId"),
+    scope: str | None = Query(default=None),
+    script_ids: list[str] | None = Query(default=None, alias="scriptIds"),
 ) -> list[dict[str, Any]]:
     get_project(project_id)
-    return get_frames(project_id, scope, script_id)
+    return get_frames(project_id, scope, script_ids)
 
 
 @app.patch("/api/frames/{frame_id}")
@@ -1056,17 +1116,20 @@ def update_frame(frame_id: str, payload: FrameUpdate) -> dict[str, Any]:
         values.append(now_iso())
         values.append(frame_id)
         conn.execute(f"UPDATE frames SET {', '.join(assignments)} WHERE id = ?", tuple(values))
-    return next(item for item in get_frames(frame["project_id"], frame["scope"], frame["script_id"]) if item["id"] == frame_id)
+    return next(item for item in get_frames(frame["project_id"], frame["scope"], [frame["script_id"]]) if item["id"] == frame_id)
 
 
 @app.post("/api/projects/{project_id}/export")
 def export_project(project_id: str, payload: ExportCreate) -> dict[str, Any]:
     project = project_detail(project_id)
-    scripts = get_scripts_for_scope(project_id, payload.scope, payload.script_id)
-    script_id = scripts[0]["id"] if payload.scope == "current_script" else None
-    frames_to_export = get_frames(project_id, payload.scope, script_id)
+    scripts = get_scripts_by_ids(project_id, payload.script_ids)
+    if not scripts:
+        raise HTTPException(status_code=400, detail="Please select at least one script")
+    selected_ids = [script["id"] for script in scripts]
+    selection_key = dump_ids(selected_ids)
+    frames_to_export = get_frames(project_id, selection_key, selected_ids)
     if not frames_to_export:
-        frames_to_export = generate_frames(project_id, payload.scope, script_id)
+        frames_to_export = generate_frames(project_id, selected_ids)
     export_id = str(uuid.uuid4())
     target_dir = EXPORT_DIR / project_id
     target_dir.mkdir(parents=True, exist_ok=True)
@@ -1074,16 +1137,15 @@ def export_project(project_id: str, payload: ExportCreate) -> dict[str, Any]:
     with zipfile.ZipFile(target, "w", compression=zipfile.ZIP_DEFLATED) as archive:
         manifest = {
             "project": project,
-            "scope": payload.scope,
-            "scriptId": script_id,
+            "scope": selection_key,
+            "scriptIds": selected_ids,
             "frameCount": len(frames_to_export),
         }
         archive.writestr("manifest.json", json.dumps(manifest, ensure_ascii=False, indent=2))
         archive.writestr("project.json", json.dumps(project, ensure_ascii=False, indent=2))
         archive.writestr("knowledge-graph/graph.json", json.dumps(project["graph"], ensure_ascii=False, indent=2))
         archive.writestr("scripts/all-scripts.md", "\n\n".join([f"# {script['title']}\n\n{script['content']}" for script in project["scripts"]]))
-        if payload.scope == "current_script":
-            archive.writestr("scripts/current-script.md", f"# {scripts[0]['title']}\n\n{scripts[0]['content']}")
+        archive.writestr("scripts/selected-scripts.md", "\n\n".join([f"# {script['title']}\n\n{script['content']}" for script in scripts]))
         for frame in frames_to_export:
             frame_dir = f"frames/{frame['frame_index']:03d}"
             scene_md = "\n".join(
@@ -1130,10 +1192,10 @@ def export_project(project_id: str, payload: ExportCreate) -> dict[str, Any]:
             INSERT INTO exports (id, project_id, script_id, scope, file_url, file_path, frame_count, created_at)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            (export_id, project_id, script_id, payload.scope, file_url, str(target), len(frames_to_export), now),
+            (export_id, project_id, None, selection_key, file_url, str(target), len(frames_to_export), now),
         )
         conn.execute("UPDATE projects SET status = ?, progress = ?, updated_at = ? WHERE id = ?", ("export_ready", 100, now, project_id))
-    return {"id": export_id, "file_url": file_url, "scope": payload.scope, "frame_count": len(frames_to_export), "created_at": now}
+    return {"id": export_id, "file_url": file_url, "scope": selection_key, "frame_count": len(frames_to_export), "created_at": now}
 
 
 ensure_directories()

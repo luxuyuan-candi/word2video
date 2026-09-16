@@ -1,4 +1,4 @@
-import type { Entity, FrameScope, Project, ProjectScript, VideoFrame } from './types';
+import type { Entity, Project, ProjectScript, VideoFrame } from './types';
 
 const API_BASE_URL = import.meta.env.VITE_API_BASE_URL ?? 'http://127.0.0.1:8000/api';
 
@@ -17,8 +17,11 @@ async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
 export const api = {
   health: () => request<{ status: string; database: string; storage: string }>('/health'),
   listProjects: () => request<Project[]>('/projects'),
-  createProject: (payload: { title?: string; script_title?: string; script: string; content_type?: string }) =>
+  createProject: (payload: { title?: string; script_title?: string; script?: string; content_type?: string }) =>
     request<Project>('/projects', { method: 'POST', body: JSON.stringify(payload) }),
+  updateProject: (projectId: string, title: string) =>
+    request<Project>(`/projects/${projectId}`, { method: 'PATCH', body: JSON.stringify({ title }) }),
+  deleteProject: (projectId: string) => request<{ status: string }>(`/projects/${projectId}`, { method: 'DELETE' }),
   getProject: (projectId: string) => request<Project>(`/projects/${projectId}`),
   addScript: (projectId: string, payload: { title?: string; content: string; content_type?: string }) =>
     request<Project>(`/projects/${projectId}/scripts`, { method: 'POST', body: JSON.stringify(payload) }),
@@ -27,6 +30,8 @@ export const api = {
       method: 'PATCH',
       body: JSON.stringify(payload),
     }),
+  deleteScript: (projectId: string, scriptId: string) =>
+    request<Project>(`/projects/${projectId}/scripts/${scriptId}`, { method: 'DELETE' }),
   setActiveScript: (projectId: string, scriptId: string) =>
     request<Project>(`/projects/${projectId}/active-script`, {
       method: 'PATCH',
@@ -49,23 +54,23 @@ export const api = {
     form.append('file', file);
     return request<Entity>(`/entities/${entityId}/reference-images`, { method: 'POST', body: form });
   },
-  generateFrames: (projectId: string, scope: FrameScope, scriptId?: string) =>
+  generateFrames: (projectId: string, scriptIds: string[]) =>
     request<VideoFrame[]>(`/projects/${projectId}/frames/generate`, {
       method: 'POST',
-      body: JSON.stringify({ scope, script_id: scriptId }),
+      body: JSON.stringify({ script_ids: scriptIds }),
     }),
-  getFrames: (projectId: string, scope?: FrameScope, scriptId?: string) => {
+  getFrames: (projectId: string, scope?: string, scriptIds?: string[]) => {
     const params = new URLSearchParams();
     if (scope) params.set('scope', scope);
-    if (scriptId) params.set('scriptId', scriptId);
+    if (scriptIds) scriptIds.forEach((scriptId) => params.append('scriptIds', scriptId));
     const query = params.toString();
     return request<VideoFrame[]>(`/projects/${projectId}/frames${query ? `?${query}` : ''}`);
   },
   updateFrame: (frameId: string, payload: Partial<VideoFrame>) =>
     request<VideoFrame>(`/frames/${frameId}`, { method: 'PATCH', body: JSON.stringify(payload) }),
-  exportProject: (projectId: string, scope: FrameScope, scriptId?: string) =>
-    request<{ id: string; file_url: string; scope: FrameScope; frame_count: number; created_at: string }>(
+  exportProject: (projectId: string, scriptIds: string[]) =>
+    request<{ id: string; file_url: string; scope: string; frame_count: number; created_at: string }>(
       `/projects/${projectId}/export`,
-      { method: 'POST', body: JSON.stringify({ scope, script_id: scriptId }) },
+      { method: 'POST', body: JSON.stringify({ script_ids: scriptIds }) },
     ),
 };

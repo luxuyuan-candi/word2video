@@ -8,7 +8,7 @@ export type ProjectStatus =
   | 'export_ready'
   | 'failed';
 
-export type FrameScope = 'current_script' | 'all_scripts';
+export type FrameScope = string;
 
 export interface ProjectScript {
   id: string;
