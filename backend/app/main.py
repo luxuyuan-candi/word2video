@@ -18,6 +18,8 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 from pydantic_settings import BaseSettings
 
+from app.script_parser import ParsedEntity, ParsedEvent, ParsedRelation, parse_project_scripts
+
 
 BACKEND_DIR = Path(__file__).resolve().parents[1]
 REPO_DIR = Path(__file__).resolve().parents[2]
@@ -652,6 +654,189 @@ def insert_graph_edge(
     )
 
 
+def upsert_parsed_entity(conn: sqlite3.Connection, project_id: str, parsed: ParsedEntity) -> str:
+    now = now_iso()
+    script_ids = [script_id for script_id, _ in parsed.mentions]
+    occurrence_count = max(1, len(parsed.mentions))
+    existing = conn.execute(
+        "SELECT * FROM entities WHERE project_id = ? AND lower(name) = lower(?)",
+        (project_id, parsed.name),
+    ).fetchone()
+    if existing:
+        conn.execute(
+            """
+            UPDATE entities
+            SET type = ?, description = ?, visual_description = COALESCE(visual_description, ?),
+                prompt = COALESCE(prompt, ?), source_script_ids = ?, occurrence_count = ?,
+                updated_at = ?
+            WHERE id = ?
+            """,
+            (
+                parsed.type,
+                parsed.description,
+                parsed.description,
+                default_prompt({"type": parsed.type, "name": parsed.name, "description": parsed.description}),
+                dump_ids(script_ids),
+                occurrence_count,
+                now,
+                existing["id"],
+            ),
+        )
+        return existing["id"]
+
+    entity_id = str(uuid.uuid4())
+    conn.execute(
+        """
+        INSERT INTO entities (
+            id, project_id, name, type, description, visual_description, prompt,
+            status, source_script_ids, occurrence_count, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            entity_id,
+            project_id,
+            parsed.name,
+            parsed.type,
+            parsed.description,
+            parsed.description,
+            default_prompt({"type": parsed.type, "name": parsed.name, "description": parsed.description}),
+            "image_pending",
+            dump_ids(script_ids),
+            occurrence_count,
+            now,
+            now,
+        ),
+    )
+    return entity_id
+
+
+def insert_parsed_entity_node(
+    conn: sqlite3.Connection,
+    project_id: str,
+    parsed: ParsedEntity,
+    entity_id: str,
+    index: int,
+) -> str:
+    script_ids = [script_id for script_id, _ in parsed.mentions]
+    source_text = " / ".join([text for _, text in parsed.mentions[:3]]) or parsed.name
+    node_id = str(uuid.uuid4())
+    conn.execute(
+        """
+        INSERT INTO graph_nodes (
+            id, project_id, type, name, description, source_text, source_script_ids,
+            change_state, entity_id, x, y
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            node_id,
+            project_id,
+            parsed.type,
+            parsed.name,
+            parsed.description,
+            source_text,
+            dump_ids(script_ids),
+            "updated" if script_ids else "existing",
+            entity_id,
+            120 + 160 * index,
+            140,
+        ),
+    )
+    return node_id
+
+
+def insert_parsed_event_node(conn: sqlite3.Connection, project_id: str, event: ParsedEvent) -> str:
+    node_id = str(uuid.uuid4())
+    conn.execute(
+        """
+        INSERT INTO graph_nodes (
+            id, project_id, type, name, description, source_text, source_script_ids,
+            change_state, entity_id, x, y
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            node_id,
+            project_id,
+            "event",
+            event.name,
+            event.description,
+            event.source_text,
+            dump_ids([event.script_id]),
+            "new",
+            None,
+            120 + 130 * ((event.order - 1) % 6),
+            420 + 95 * ((event.order - 1) // 6),
+        ),
+    )
+    return node_id
+
+
+def insert_parsed_relation(
+    conn: sqlite3.Connection,
+    project_id: str,
+    relation: ParsedRelation,
+    key_to_node: dict[str, str],
+) -> None:
+    source_node_id = key_to_node.get(relation.source_key)
+    target_node_id = key_to_node.get(relation.target_key)
+    if not source_node_id or not target_node_id or source_node_id == target_node_id:
+        return
+    insert_graph_edge(
+        conn,
+        project_id,
+        source_node_id,
+        target_node_id,
+        relation.relation,
+        relation.description,
+        relation.source_text,
+        relation.script_id,
+    )
+
+
+def relayout_graph(conn: sqlite3.Connection, project_id: str) -> None:
+    rows = conn.execute("SELECT id, type FROM graph_nodes WHERE project_id = ? ORDER BY rowid", (project_id,)).fetchall()
+    y_by_type = {"character": 110, "object": 230, "scene": 350, "event": 500, "concept": 680}
+    counts: dict[str, int] = {}
+    for row in rows:
+        node_type = row["type"]
+        count = counts.get(node_type, 0)
+        counts[node_type] = count + 1
+        conn.execute(
+            "UPDATE graph_nodes SET x = ?, y = ? WHERE id = ?",
+            (120 + 150 * count, y_by_type.get(node_type, 760), row["id"]),
+        )
+
+
+def analyze_project_graph(project_id: str) -> dict[str, Any]:
+    scripts = get_scripts(project_id)
+    if not scripts:
+        raise HTTPException(status_code=400, detail="Project has no script")
+    parsed = parse_project_scripts(scripts)
+    now = now_iso()
+    with connect() as conn:
+        conn.execute("DELETE FROM graph_edges WHERE project_id = ?", (project_id,))
+        conn.execute("DELETE FROM graph_nodes WHERE project_id = ?", (project_id,))
+        for script in scripts:
+            conn.execute("UPDATE project_scripts SET status = ?, updated_at = ? WHERE id = ?", ("analyzing", now, script["id"]))
+
+        key_to_node: dict[str, str] = {}
+        for index, entity in enumerate(parsed.entities):
+            entity_id = upsert_parsed_entity(conn, project_id, entity)
+            key_to_node[f"entity:{entity.name}"] = insert_parsed_entity_node(conn, project_id, entity, entity_id, index)
+        for event in parsed.events:
+            key_to_node[event.key] = insert_parsed_event_node(conn, project_id, event)
+        for relation in parsed.relations:
+            insert_parsed_relation(conn, project_id, relation, key_to_node)
+        relayout_graph(conn, project_id)
+
+        for script in scripts:
+            conn.execute("UPDATE project_scripts SET status = ?, updated_at = ? WHERE id = ?", ("analyzed", now, script["id"]))
+        conn.execute(
+            "UPDATE projects SET status = ?, progress = ?, updated_at = ? WHERE id = ?",
+            ("graph_ready", 45, now, project_id),
+        )
+    return project_detail(project_id)
+
+
 def analyze_script_into_project(project_id: str, script_id: str) -> dict[str, Any]:
     project = get_project(project_id)
     script = get_script(script_id)
@@ -1098,18 +1283,12 @@ def set_active_script(project_id: str, payload: ActiveScriptUpdate) -> dict[str,
 
 @app.post("/api/projects/{project_id}/analyze")
 def analyze_active_project_script(project_id: str) -> dict[str, Any]:
-    scripts = get_scripts(project_id)
-    if not scripts:
-        raise HTTPException(status_code=400, detail="Project has no script")
-    detail: dict[str, Any] | None = None
-    for script in scripts:
-        detail = analyze_script_into_project(project_id, script["id"])
-    return detail or project_detail(project_id)
+    return analyze_project_graph(project_id)
 
 
 @app.post("/api/projects/{project_id}/scripts/{script_id}/analyze")
 def analyze_project_script(project_id: str, script_id: str) -> dict[str, Any]:
-    return analyze_script_into_project(project_id, script_id)
+    return analyze_project_graph(project_id)
 
 
 @app.get("/api/projects/{project_id}/graph")
